@@ -1,5 +1,6 @@
 """Module for Jira epic operations."""
 
+import json
 import logging
 from typing import Any
 
@@ -13,6 +14,15 @@ from .protocols import (
 )
 
 logger = logging.getLogger("mcp-jira")
+
+# Schema key Jira Software uses for the Epic Link custom field. It is the
+# plugin key, so it is identical on Cloud, on Server/DC and in every
+# localisation, unlike the field's display name.
+EPIC_LINK_FIELD_SCHEMA = "com.pyxis.greenhopper.jira:gh-epic-link"
+# Field ID Jira Cloud ships Epic Link under. Field discovery in
+# ``FieldsMixin.get_field_ids_to_epic`` trusts this ID on its own, so the
+# credibility check below has to accept it for the same reason.
+CLOUD_EPIC_LINK_FIELD_ID = "customfield_10014"
 
 
 class EpicsMixin(
@@ -316,9 +326,184 @@ class EpicsMixin(
             issue_type_name
         )
 
+    @staticmethod
+    def _epic_link_value_matches(value: Any, epic_key: str) -> bool:
+        """Check whether a stored field value points at the given epic.
+
+        Args:
+            value: Raw field value as returned by the Jira API. Epic Link
+                custom fields hold the epic key as a plain string; ``parent``
+                holds a nested issue object.
+            epic_key: The epic key the value is expected to identify.
+
+        Returns:
+            True if the value identifies the epic, False otherwise.
+        """
+        expected = epic_key.strip()
+        if isinstance(value, str):
+            return value.strip() == expected
+        if isinstance(value, dict):
+            for nested_key in ("key", "id"):
+                nested = value.get(nested_key)
+                if isinstance(nested, str) and nested.strip() == expected:
+                    return True
+        return False
+
+    def _epic_link_written(self, issue_key: str, field_id: str, epic_key: str) -> bool:
+        """Read one field back and confirm it now stores the epic key.
+
+        A Jira PUT that changes nothing still answers ``204 No Content``, so an
+        accepted request is not evidence of a write. Measured on Server/DC: a
+        ``parent`` update was accepted while the field stayed null, ``updated``
+        was unchanged and the changelog stayed empty, yet the caller was told
+        the link succeeded. Only the stored value settles it.
+
+        The read requests just the one field so the verification stays cheap
+        and cannot be confused with the full issue fetch used for the result.
+
+        Args:
+            issue_key: The key of the issue that was updated.
+            field_id: The ID of the field that was written.
+            epic_key: The epic key the field is expected to hold.
+
+        Returns:
+            True if the field now holds the epic key. False if it does not, or
+            if the field could not be read back at all -- an unreadable field
+            is reported as a failure on purpose, because a loud false negative
+            is recoverable while a silent false positive is not.
+        """
+        try:
+            stored = self.jira.get_issue(issue_key, fields=field_id)
+        except Exception as e:
+            # The underlying client raises library-specific and requests
+            # exceptions here; any of them means "not verified".
+            logger.info(
+                f"Could not read field {field_id} back from {issue_key} to "
+                f"verify the epic link: {str(e)}"
+            )
+            return False
+
+        if isinstance(stored, str):
+            # atlassian-python-api hands back the raw body as a string on Jira
+            # Server/DC when ``response.json()`` fails; ``IssuesMixin`` carries
+            # the same ``json.loads`` workaround for its own read-back. Without
+            # it that transport quirk turns a write that did land into a raised
+            # "could not link" error on the very instance family this
+            # verification was written for.
+            try:
+                stored = json.loads(stored)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"Verification read of {issue_key} returned an unparseable "
+                    f"string payload, so {field_id} could not be confirmed"
+                )
+                return False
+
+        if not isinstance(stored, dict):
+            logger.warning(
+                f"Unexpected return value type from `jira.get_issue`: {type(stored)}"
+            )
+            return False
+
+        stored_fields = stored.get("fields")
+        if not isinstance(stored_fields, dict):
+            logger.info(
+                f"Verification read of {issue_key} returned no fields, so "
+                f"{field_id} could not be confirmed"
+            )
+            return False
+
+        return self._epic_link_value_matches(stored_fields.get(field_id), epic_key)
+
+    @staticmethod
+    def _is_epic_link_field_definition(definition: Any) -> bool:
+        """Check whether a Jira field definition describes the Epic Link field.
+
+        Mirrors the discovery rule in ``FieldsMixin.get_field_ids_to_epic`` so
+        a field is accepted here for exactly the reasons it can be discovered
+        there: the Jira Software schema key, an ``Epic Link``-shaped display
+        name, or the field ID Jira Cloud ships Epic Link under.
+
+        Args:
+            definition: One entry from ``get_fields()``.
+
+        Returns:
+            True if the definition describes an Epic Link field.
+        """
+        if not isinstance(definition, dict):
+            return False
+
+        schema = definition.get("schema")
+        if isinstance(schema, dict) and schema.get("custom") == EPIC_LINK_FIELD_SCHEMA:
+            return True
+
+        if definition.get("id") == CLOUD_EPIC_LINK_FIELD_ID:
+            return True
+
+        name = definition.get("name")
+        if not isinstance(name, str):
+            return False
+        normalized = name.strip().lower()
+        return normalized in ("epic link", "epic") or "epic link" in normalized
+
+    def _epic_link_candidate_is_credible(self, field_id: str) -> bool:
+        """Cross-check a discovered Epic Link field against this instance.
+
+        ``get_field_ids_to_epic`` maps every field definition's name onto its
+        result dictionary, so a definition literally named ``epic_link`` lands
+        on the same key the genuine Epic Link discovery uses -- and wins if it
+        is processed later. That is how the fabricated
+        ``{"id": <guess>, "name": "epic_link"}`` entry ``get_epic_issues`` used
+        to append to ``_field_ids_cache`` became this function's first write
+        candidate. Writing an epic key into whatever such a guess points at is
+        the defect the blind custom-field sweep was deleted for: on the
+        measured Server/DC instance ``customfield_10008`` is Epic Name, a plain
+        string field that accepts the write, so the read-back would confirm it
+        and the caller would be told the issue had been linked while in fact
+        only the epic name field had been clobbered.
+
+        The already-cached definitions are read directly rather than through
+        ``get_fields()``: the check must not itself trigger a field fetch, and
+        a fabricated definition can only ever live in that cache.
+        ``get_field_ids_to_epic`` has just populated it on any instance whose
+        field list is readable, and where it is not readable no ``epic_link``
+        is discovered in the first place.
+
+        Args:
+            field_id: The field ID discovered under the ``epic_link`` key.
+
+        Returns:
+            True if this instance's own field definitions describe ``field_id``
+            as an Epic Link field. Also True when no definitions are cached or
+            none mentions the field at all: an unverifiable candidate is still
+            attempted, because the stored-value read-back then decides it.
+            False only when the cached definitions positively describe the
+            field as something else.
+        """
+        definitions = self._field_ids_cache
+        if not isinstance(definitions, list) or not definitions:
+            # No field definitions to cross-check against; keep the
+            # discovered field and let the read-back decide.
+            return True
+
+        matching = [
+            definition
+            for definition in definitions
+            if isinstance(definition, dict) and definition.get("id") == field_id
+        ]
+        if not matching:
+            return True
+
+        return any(
+            self._is_epic_link_field_definition(definition) for definition in matching
+        )
+
     def link_issue_to_epic(self, issue_key: str, epic_key: str) -> JiraIssue:
         """
         Link an existing issue to an epic.
+
+        Each candidate field is written and then read back, so the issue is
+        only reported as linked once the epic key is actually stored on it.
 
         Args:
             issue_key: The key of the issue to link (e.g. 'PROJ-123')
@@ -328,7 +513,10 @@ class EpicsMixin(
             JiraIssue: The updated issue
 
         Raises:
-            ValueError: If the epic_key is not an actual epic
+            ValueError: If the epic_key is not an actual epic, or if no
+                candidate field could be verified as holding the epic key
+                after the update
+            TypeError: If the Jira API returns an unexpected payload type
             Exception: If there is an error linking the issue to the epic
         """
         try:
@@ -356,89 +544,61 @@ class EpicsMixin(
             # Get the dynamic field IDs for this Jira instance
             field_ids = self.get_field_ids_to_epic()
 
-            # Try the parent field first (if discovered or natively supported)
-            if "parent" in field_ids or "parent" not in field_ids:
-                try:
-                    fields = {"parent": {"key": epic_key}}
-                    self.jira.update_issue(
-                        issue_key=issue_key, update={"fields": fields}
-                    )
-                    logger.info(
-                        f"Successfully linked {issue_key} to {epic_key} using parent field"
-                    )
-                    return self.get_issue(issue_key)
-                except Exception as e:
-                    logger.info(
-                        f"Couldn't link using parent field: {str(e)}. Trying discovered fields..."
-                    )
+            # Ordered link candidates. The discovered Epic Link custom field is
+            # tried first because it is the mechanism that actually writes on
+            # Server/DC; ``parent`` is the Cloud team-managed mechanism and the
+            # fallback. There is deliberately no ``is_cloud`` gate: every
+            # attempt is verified by reading the stored value back, so a wrong
+            # first candidate costs one no-op request instead of a wrong answer.
+            candidates: list[tuple[str, Any]] = []
+            epic_link_field = field_ids.get("epic_link")
+            if epic_link_field and not self._epic_link_candidate_is_credible(
+                epic_link_field
+            ):
+                logger.warning(
+                    f"Ignoring discovered epic link field {epic_link_field}: this "
+                    "Jira instance describes it as a different field, so writing "
+                    f"{epic_key} into it would overwrite unrelated data on "
+                    f"{issue_key}."
+                )
+                epic_link_field = None
+            if epic_link_field:
+                candidates.append((epic_link_field, epic_key))
+            candidates.append(("parent", {"key": epic_key}))
 
-            # Try using the discovered Epic Link field
-            if "epic_link" in field_ids:
-                try:
-                    epic_link_fields: dict[str, str] = {
-                        field_ids["epic_link"]: epic_key
-                    }
-                    self.jira.update_issue(
-                        issue_key=issue_key, update={"fields": epic_link_fields}
-                    )
-                    logger.info(
-                        f"Successfully linked {issue_key} to {epic_key} using discovered epic_link field: {field_ids['epic_link']}"
-                    )
-                    return self.get_issue(issue_key)
-                except Exception as e:
-                    logger.info(
-                        f"Couldn't link using discovered epic_link field: {str(e)}. Trying fallback methods..."
-                    )
-
-            # Fallback to common custom fields if dynamic discovery didn't work
-            custom_field_attempts: list[dict[str, str]] = [
-                {"customfield_10014": epic_key},  # Common in Jira Cloud
-                {"customfield_10008": epic_key},  # Common in Jira Server
-                {"customfield_10000": epic_key},  # Also common
-                {"customfield_11703": epic_key},  # Known from previous error
-                {"epic_link": epic_key},  # Sometimes used
-            ]
-
-            for fields in custom_field_attempts:
+            for field_id, field_value in candidates:
                 try:
                     self.jira.update_issue(
-                        issue_key=issue_key, update={"fields": fields}
+                        issue_key=issue_key,
+                        update={"fields": {field_id: field_value}},
                     )
-                    field_id = list(fields.keys())[0]
-                    logger.info(
-                        f"Successfully linked {issue_key} to {epic_key} using field: {field_id}"
-                    )
-
-                    # If we get here, it worked - update our cached field ID
-                    if self._field_ids_cache is None:
-                        self._field_ids_cache = []
-                    self._field_ids_cache.append({"id": field_id, "name": "epic_link"})
-                    return self.get_issue(issue_key)
                 except Exception as e:
-                    logger.info(f"Couldn't link using fields {fields}: {str(e)}")
+                    logger.info(
+                        f"Couldn't link {issue_key} to {epic_key} using field "
+                        f"{field_id}: {str(e)}. Trying the next candidate..."
+                    )
                     continue
 
-            # Method 2: Try to use direct issue linking (relates to, etc.)
-            try:
-                logger.info(
-                    f"Attempting to create issue link between {issue_key} and {epic_key}"
-                )
-                link_data = {
-                    "type": {"name": "Relates to"},
-                    "inwardIssue": {"key": issue_key},
-                    "outwardIssue": {"key": epic_key},
-                }
-                self.jira.create_issue_link(link_data)
-                logger.info(
-                    f"Created relationship link between {issue_key} and {epic_key}"
-                )
-                return self.get_issue(issue_key)
-            except Exception as link_error:
-                logger.error(f"Error creating issue link: {str(link_error)}")
+                if self._epic_link_written(issue_key, field_id, epic_key):
+                    logger.info(
+                        f"Successfully linked {issue_key} to {epic_key} using "
+                        f"field {field_id}"
+                    )
+                    return self.get_issue(issue_key)
 
-            # If we get here, none of our attempts worked
+                logger.info(
+                    f"Update of field {field_id} on {issue_key} was accepted "
+                    f"but did not store {epic_key}. Trying the next candidate..."
+                )
+
+            # Every candidate was either rejected or silently discarded, so no
+            # epic link exists. Never report success here: an unverified write
+            # is what PROPX-398 was opened about.
             raise ValueError(
-                f"Could not link issue {issue_key} to epic {epic_key}. Your Jira instance might use a different field for epic links."
+                f"Could not link issue {issue_key} to epic {epic_key}. "
+                "No epic link field on the issue holds the epic key after the "
+                "update, so your Jira instance might use a different field "
+                "for epic links."
             )
 
         except ValueError:
@@ -645,12 +805,16 @@ class EpicsMixin(
                             logger.info(
                                 f"Successfully found {len(issues)} issues for epic {epic_key} using field ID {field_id}"
                             )
-                            # Cache this successful field ID for future use
-                            if self._field_ids_cache is None:
-                                self._field_ids_cache = []
-                            self._field_ids_cache.append(
-                                {"id": field_id, "name": "epic_link"}
-                            )
+                            # Deliberately NOT cached. Appending
+                            # {"id": field_id, "name": "epic_link"} to
+                            # _field_ids_cache fabricated a field definition:
+                            # get_field_ids_to_epic maps every definition name
+                            # onto its result, so that entry overwrote the
+                            # genuine Epic Link discovery for the life of the
+                            # fetcher and link_issue_to_epic then wrote the
+                            # epic key into the guessed field. A JQL match here
+                            # only proves the field is queryable, not that it
+                            # is the Epic Link field.
                             return issues
                     except Exception:
                         # Just try the next field ID
