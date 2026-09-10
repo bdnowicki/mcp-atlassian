@@ -76,7 +76,9 @@ uv run pytest --cov=src/mcp_atlassian --cov-report=term-missing  # coverage
 - **Cloud vs Server/DC**: API endpoints, field names, and auth methods differ. Always check `is_cloud` before assuming behavior.
 - **OAuth 2.0**: Supported on both Cloud and Server/Data Center. PAT is also available for Server/DC. Basic auth (user + API token) works on both Cloud and Server/DC.
 - **Read-only mode**: `READ_ONLY_MODE=true` blocks all write tools at server level.
-- **Type checking**: pre-commit runs **mypy** (strict mode).
+- **Type checking**: pre-commit runs **mypy**, but *not* in strict mode. The hook passes `--ignore-missing-imports --no-strict-optional` and disables a dozen error codes (`index`, `assignment`, `arg-type`, `return-value`, `no-untyped-def`, …). `[tool.mypy]` in `pyproject.toml` also sets `exclude = "^src/"` and relaxes `disallow_untyped_defs` for `src.mcp_atlassian.*`, so library source is checked far less strictly than the strict-looking settings in that table suggest. Treat `uv run pre-commit run mypy --files <paths>` as the authoritative check.
+- **Lint gates are not clean repo-wide**: bare `uv run ruff check .` exits 1 with ~1150 pre-existing findings, and `ruff format --check .` flags one unrelated file. Only the rules pre-commit actually enforces matter — reproduce with `uv run pre-commit run --files <paths>`, and prefer `--files` over `--all-files` so the hooks cannot reformat files your change never touched.
+- **Windows/pytest**: four unit tests fail on Windows regardless of your change (POSIX file-permission bits and platform MIME/timestamp behaviour) — in `tests/unit/jira/test_attachments.py`, `tests/unit/utils/test_date.py`, `tests/unit/utils/test_media.py`, `tests/unit/utils/test_oauth.py`. Compare against a clean worktree before attributing a failure to your work.
 - **Environment**: See `.env.example` for all configuration options (auth, proxy, SLA, filtering).
 
 ---
