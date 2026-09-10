@@ -1,5 +1,7 @@
 """Unit tests for generated tool documentation helpers."""
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -349,27 +351,36 @@ def test_category_template_renders_notes_and_safe_nested_json() -> None:
 def _write_count_documents(root: Path, counts: ToolCounts) -> None:
     """Write count-bearing documents with the supplied registry values."""
     (root / "docs").mkdir()
-    (root / "README.md").write_text(f"**{counts.total_tools} tools total**\n")
+    # Always pass encoding explicitly: the generator reads these documents as
+    # UTF-8, so a fixture written with the locale default would be decoded
+    # with the wrong codec on a non-UTF-8 host (cp1252 on Windows).
+    (root / "README.md").write_text(
+        f"**{counts.total_tools} tools total**\n", encoding="utf-8"
+    )
     (root / ".env.example").write_text(
         f"# Only core tools (~{counts.core_tools} tools)\n"
         f"# All {counts.total_toolsets} toolsets ({counts.total_tools} tools)\n"
-        f"# If unset, all toolsets are enabled ({counts.total_tools} tools).\n"
+        f"# If unset, all toolsets are enabled ({counts.total_tools} tools).\n",
+        encoding="utf-8",
     )
     (root / "docs.json").write_text(
-        f'{{"description": "all {counts.total_tools} tools enabled by default"}}\n'
+        f'{{"description": "all {counts.total_tools} tools enabled by default"}}\n',
+        encoding="utf-8",
     )
     (root / "docs" / "tools-reference.mdx").write_text(
         f'---\ndescription: "Overview of all {counts.total_tools} MCP tools"\n---\n'
         f"MCP Atlassian provides **{counts.total_tools} tools**.\n"
         f"**Jira Toolsets ({counts.jira_toolsets}):**\n"
         f"**Confluence Toolsets ({counts.confluence_toolsets}):**\n"
-        f"# Enable all toolsets ({counts.total_tools} tools)\n"
+        f"# Enable all toolsets ({counts.total_tools} tools)\n",
+        encoding="utf-8",
     )
     (root / "docs" / "configuration.mdx").write_text(
         f"# Restrict to core tools only (~{counts.core_tools} tools across "
         f"{counts.core_toolsets} core toolsets)\n"
         f"In v0.22.0, the default will change from all toolsets to "
-        f"{counts.core_toolsets} core toolsets only.\n"
+        f"{counts.core_toolsets} core toolsets only.\n",
+        encoding="utf-8",
     )
 
 
@@ -425,7 +436,10 @@ def test_check_counts_rejects_valid_number_in_wrong_context(
     )
     _write_count_documents(tmp_path, counts)
     path = tmp_path / relative_path
-    path.write_text(path.read_text().replace(old_text, new_text))
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(old_text, new_text),
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(generator, "ROOT", tmp_path)
     monkeypatch.setattr(generator, "get_tool_counts", lambda tools: counts)
@@ -455,10 +469,11 @@ def test_check_mode_rejects_stale_warning_core_toolset_count(
     _write_count_documents(tmp_path, counts)
     path = tmp_path / "docs" / "configuration.mdx"
     path.write_text(
-        path.read_text().replace(
+        path.read_text(encoding="utf-8").replace(
             "to 6 core toolsets only",
             "to 30 core toolsets only",
-        )
+        ),
+        encoding="utf-8",
     )
 
     async def fake_get_all_tools() -> dict[str, dict[str, object]]:
@@ -532,13 +547,141 @@ def test_check_generated_pages_detects_stale_toolset_membership(
     )
     for path, content in rendered.items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
 
     reference_output.write_text(
-        reference_output.read_text().replace("`jira_example_tool`", "`stale_jira_tool`")
+        reference_output.read_text(encoding="utf-8").replace(
+            "`jira_example_tool`", "`stale_jira_tool`"
+        ),
+        encoding="utf-8",
     )
 
     assert not check_generated_pages(
+        category_docs,
+        toolset_docs,
+        counts,
+        TEMPLATE_DIR,
+        output_dir,
+        reference_output,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Text encoding regression tests (PROPX-398 repair round)
+# ---------------------------------------------------------------------------
+#
+# ``scripts/generate_tool_docs.py`` read and wrote every documentation file
+# with the locale's default codec.  On a Windows host that codec is cp1252,
+# and ``docs/`` legitimately contains characters it cannot represent (U+2192
+# RIGHTWARDS ARROW, used throughout the generated tables), so:
+#
+#   * ``--check`` died with ``UnicodeDecodeError: 'charmap' codec can't decode
+#     byte 0x9d`` before it could report anything, and
+#   * a plain (generating) run died with ``UnicodeEncodeError`` -- i.e. the
+#     very command AGENTS.md rule 8 mandates after a tool-signature change
+#     could not be run at all on this platform.
+#
+# CI runs on Linux with a UTF-8 locale, so neither failure was ever visible
+# there.  A test that merely feeds non-ASCII text through the helpers is
+# therefore green on CI regardless of the bug; the portable check below runs
+# the real entry point under ``-X warn_default_encoding``, which makes CPython
+# emit ``EncodingWarning`` at every default-encoding call site on every
+# platform.
+
+
+def test_generate_tool_docs_passes_explicit_encoding_at_every_io_site() -> None:
+    """The docs generator must never rely on the locale's default codec.
+
+    Platform-independent guard: ``-X warn_default_encoding`` makes CPython
+    raise ``EncodingWarning`` from any ``open`` / ``read_text`` / ``write_text``
+    that omits ``encoding=``, so this fails on Linux CI too rather than only on
+    a cp1252 host.  Verified to fail against the unpatched script with
+    ``EncodingWarning: 'encoding' argument not specified`` at ``check_counts``.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "warn_default_encoding",
+            "-W",
+            "error::EncodingWarning",
+            "scripts/generate_tool_docs.py",
+            "--check",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = result.stdout + result.stderr
+
+    assert "EncodingWarning" not in combined, (
+        "generate_tool_docs.py performs file IO without an explicit encoding:\n"
+        f"{combined}"
+    )
+    assert result.returncode == 0, (
+        f"--check exited {result.returncode} under warn_default_encoding:\n{combined}"
+    )
+
+
+def test_check_generated_pages_reads_non_ascii_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Freshness checks must not corrupt or crash on non-ASCII documentation.
+
+    Reproduces the measured Windows failure directly: the committed pages
+    contain U+2192, which cp1252 cannot decode, so the unpatched
+    ``path.read_text()`` raised ``UnicodeDecodeError`` instead of comparing.
+    """
+    counts = ToolCounts(
+        total_tools=1,
+        jira_tools=1,
+        confluence_tools=0,
+        core_tools=1,
+        total_toolsets=2,
+        jira_toolsets=1,
+        confluence_toolsets=1,
+        core_toolsets=2,
+    )
+    category_docs = {
+        "jira-issues": [
+            ToolDoc(
+                name="jira_example_tool",
+                display_name="Example Tool",
+                description="Moves an issue → the next status (é—✓).",
+                is_write=False,
+            )
+        ]
+    }
+    toolset_docs = {
+        "jira": [
+            ToolsetDoc(name="jira_issues", core=True, tools=["jira_example_tool"])
+        ],
+        "confluence": [ToolsetDoc(name="confluence_pages", core=True)],
+    }
+    output_dir = tmp_path / "docs" / "tools"
+    reference_output = tmp_path / "docs" / "tools-reference.mdx"
+    monkeypatch.setattr(generator, "ROOT", tmp_path)
+
+    rendered = render_pages(
+        category_docs,
+        toolset_docs,
+        counts,
+        TEMPLATE_DIR,
+        output_dir,
+        reference_output,
+    )
+    # Guard the fixture itself: if the template ever stops emitting the arrow
+    # this test would silently stop covering the decode path.
+    assert any("→" in content for content in rendered.values())
+
+    for path, content in rendered.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    assert check_generated_pages(
         category_docs,
         toolset_docs,
         counts,
