@@ -44,6 +44,41 @@ def _extract_blocks(
     return re.sub(pattern, _replacer, text, flags=flags)
 
 
+def _extract_tag_pair(
+    text: str,
+    pattern: str,
+    storage: list[str],
+    prefix: str,
+) -> str:
+    """Protect the delimiters of a COMPLETE tag pair, leaving the content exposed.
+
+    Unlike :func:`_extract_blocks`, which swaps the whole match for one
+    placeholder, this replaces only the opening and closing delimiters and
+    leaves the content in the text, so the content is still converted.
+    Requiring both delimiters in one match is what keeps an unpaired or
+    unclosed tag out of the protected set.
+
+    Args:
+        text: Input text to process.
+        pattern: Regex capturing exactly three groups - opening delimiter,
+            inner content, closing delimiter.
+        storage: List to store the protected delimiters.
+        prefix: Placeholder prefix (e.g., "HTMLCVTTAG").
+
+    Returns:
+        Text with each pair's delimiters replaced by placeholders.
+    """
+
+    def _replacer(match: re.Match[str]) -> str:
+        opening = f"\x00{prefix}{len(storage)}\x00"
+        storage.append(match.group(1))
+        closing = f"\x00{prefix}{len(storage)}\x00"
+        storage.append(match.group(3))
+        return f"{opening}{match.group(2)}{closing}"
+
+    return re.sub(pattern, _replacer, text)
+
+
 def _restore_blocks(text: str, storage: list[str], prefix: str) -> str:
     """Restore blocks from placeholders.
 
@@ -487,17 +522,63 @@ class BasePreprocessor:
             "HTMLCVTINLINE",
         )
 
+        # jira_to_markdown emits <cite>/<ins>/<sup>/<sub>/<span style=...> as
+        # its interchange format for wiki spans Markdown cannot express, and
+        # the markdown_to_jira writer maps them back.  markdownify drops
+        # unknown tags and keeps only their text, which silently DELETED every
+        # one of those spans.  <del> is deliberately NOT protected:
+        # markdownify renders it as ``~~x~~``, which the writer's own
+        # ``~~(.*?)~~`` rule converts back.
+        #
+        # The protected set is EXACTLY what the writer consumes, and only as a
+        # COMPLETE pair: bare <cite>/<ins>/<sup>/<sub> with no attributes, and
+        # the colour span ``<span style="color:...">``.  Foreign HTML -
+        # <span class="x">, <ins class="q">, a bare <span>, a lone </ins> - is
+        # deliberately left for markdownify to unwrap to its text, exactly as
+        # it did before the interchange tags were protected.  The writer has
+        # no rule for those shapes, so its generic ``<([^>]+)>`` -> ``[\1]``
+        # fallback would turn a surviving foreign tag into
+        # ``[span class="x"]``, which Jira renders as span.error bracket text.
+        # Leaving them unwrapped keeps read -> write a fixpoint for that shape.
+        #
+        # Only the DELIMITERS are protected, never the content, so real HTML
+        # inside a protected span is still converted.  Each pattern mirrors the
+        # writer's own pairing rule, so a protected pair is always one the
+        # writer can map back: ``(.*?)`` (newline-bounded) for the tag map,
+        # ``[\s\S]*?`` for the colour span.
+        wiki_tags: list[str] = []
+
+        for tag in ("cite", "ins", "sup", "sub"):
+            text = _extract_tag_pair(
+                text,
+                rf"(<{tag}>)(.*?)(</{tag}>)",
+                wiki_tags,
+                "HTMLCVTTAG",
+            )
+        text = _extract_tag_pair(
+            text,
+            r'(<span style="color:[^"\n]+">)([\s\S]*?)(</span>)',
+            wiki_tags,
+            "HTMLCVTTAG",
+        )
+
         if re.search(r"<[^>]+>", text):
             try:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=UserWarning)
                     soup = BeautifulSoup(f"<div>{text}</div>", "html.parser")
                     html = str(soup.div.decode_contents()) if soup.div else text
-                    text = md(html)
+                    # markdownify defaults to backslash-escaping ``*`` and
+                    # ``_``, which mangled the emphasis jira_to_markdown had
+                    # already produced (``**BOLD**`` -> ``\*\*BOLD\*\*``) and
+                    # every snake_case identifier.  Pass the options at the
+                    # call site only; never change markdownify's own defaults.
+                    text = md(html, escape_asterisks=False, escape_underscores=False)
             except Exception as e:
                 logger.warning(f"Error converting HTML to markdown: {str(e)}")
 
-        # Restore in reverse order: inline first, then blocks
+        # Restore in reverse order of extraction: wiki tags, inline, blocks
+        text = _restore_blocks(text, wiki_tags, "HTMLCVTTAG")
         text = _restore_blocks(text, inline_codes, "HTMLCVTINLINE")
         text = _restore_blocks(text, code_blocks, "HTMLCVTBLOCK")
         return text

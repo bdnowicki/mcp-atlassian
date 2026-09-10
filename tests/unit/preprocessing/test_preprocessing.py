@@ -147,10 +147,14 @@ def test_clean_jira_text_smart_links(preprocessor_with_jira):
     confluence_url = (
         f"{base_url}/wiki/spaces/PROJ/pages/987654321/Example+Meeting+Notes"
     )
-    processed_url = f"{base_url}/wiki/spaces/PROJ/pages/987654321/ExampleMeetingNotes"
     text = f"[Meeting Notes|{confluence_url}|smart-link]"
     cleaned = preprocessor_with_jira.clean_jira_text(text)
-    assert cleaned == f"[Example Meeting Notes]({processed_url})"
+    # PROPX-398: the `+` characters are part of the URL. The old expectation
+    # hardcoded defect 2a — the unanchored `\+([^+]*)\+` "inserted text" rule
+    # ate them as an <ins> span and markdownify then stripped the tags, so
+    # `Example+Meeting+Notes` came back as `ExampleMeetingNotes` and the link
+    # target was broken. The URL must survive intact.
+    assert cleaned == f"[Example Meeting Notes]({confluence_url})"
 
 
 @pytest.mark.parametrize(
