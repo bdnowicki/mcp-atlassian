@@ -292,17 +292,92 @@ class TestPrepareEpicLinkFields:
 
         assert fields["parent"] == {"key": "EPIC-1"}
 
-    def test_server_no_fallback_to_parent(self, issues_mixin):
-        """On Server/DC, if no epic link field discovered, do NOT set parent."""
+    def test_server_unresolved_alias_raises_instead_of_no_op(self, issues_mixin):
+        """On Server/DC with no epic link field, raise rather than write nothing.
+
+        Replaces the previous contract, which asserted only that ``parent``
+        was not set. PROPX-398: leaving *fields* untouched made ``update_issue``
+        skip its PUT entirely and still return the issue as updated, i.e. the
+        same silent no-op the ticket was opened about on
+        ``link_issue_to_epic``. ``parent`` is still not a Server/DC fallback --
+        Jira Server/DC has no parent-based epic link -- so the branch has to
+        fail instead of guessing.
+        """
         issues_mixin.config.is_cloud = False
         issues_mixin.get_field_ids_to_epic = MagicMock(return_value={})
         fields: dict = {}
         kwargs = {"epicKey": "EPIC-1"}
 
-        issues_mixin._prepare_epic_link_fields(fields, kwargs)
+        with pytest.raises(ValueError, match="Could not resolve epic link alias"):
+            issues_mixin._prepare_epic_link_fields(fields, kwargs)
 
         assert "parent" not in fields
         assert "customfield_10014" not in fields
+        assert fields == {}
+
+    def test_server_field_discovery_failure_raises(self, issues_mixin):
+        """A failed field lookup is not an excuse to write nothing quietly."""
+        issues_mixin.config.is_cloud = False
+        issues_mixin.get_field_ids_to_epic = MagicMock(
+            side_effect=RuntimeError("fields unavailable")
+        )
+        fields: dict = {}
+
+        with pytest.raises(ValueError, match="Could not resolve epic link alias"):
+            issues_mixin._prepare_epic_link_fields(fields, {"epicKey": "EPIC-1"})
+
+        assert fields == {}
+
+    def test_resolved_alias_reports_the_field_to_read_back(self, issues_mixin):
+        """The resolved field is returned so the caller can verify the write.
+
+        Jira answers ``204 No Content`` to a PUT that stores nothing, so
+        preparing the field is not evidence of a write; the caller reads this
+        field back afterwards (see IssuesMixin._verify_epic_link_written).
+        """
+        issues_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014"}
+        )
+        fields: dict = {}
+
+        pending = issues_mixin._prepare_epic_link_fields(fields, {"epicKey": "EPIC-1"})
+
+        assert pending == ("customfield_10014", "EPIC-1")
+
+    def test_cloud_parent_fallback_reports_parent_to_read_back(self, issues_mixin):
+        """The Cloud parent fallback is verified like any other candidate."""
+        issues_mixin.config.is_cloud = True
+        issues_mixin.get_field_ids_to_epic = MagicMock(return_value={})
+        fields: dict = {}
+
+        pending = issues_mixin._prepare_epic_link_fields(fields, {"epicKey": "EPIC-1"})
+
+        assert pending == ("parent", "EPIC-1")
+
+    def test_explicit_parent_conflict_reports_nothing_to_verify(
+        self, issues_mixin, caplog
+    ):
+        """An explicit parent wins, and nothing was set from the alias.
+
+        Nothing to verify here, because nothing was written from the alias --
+        but the ignored alias is now logged as a warning instead of vanishing.
+        """
+        issues_mixin.config.is_cloud = True
+        issues_mixin.get_field_ids_to_epic = MagicMock(return_value={})
+        fields: dict = {"parent": {"key": "EXISTING-1"}}
+
+        with caplog.at_level("WARNING", logger="mcp-jira"):
+            pending = issues_mixin._prepare_epic_link_fields(
+                fields, {"epicKey": "EPIC-1"}
+            )
+
+        assert pending is None
+        assert fields["parent"] == {"key": "EXISTING-1"}
+        assert "Ignoring epic link alias" in caplog.text
+
+    def test_no_alias_reports_nothing_to_verify(self, issues_mixin):
+        """NEGATIVE CONTROL: an update without an epic alias verifies nothing."""
+        assert issues_mixin._prepare_epic_link_fields({}, {"priority": "High"}) is None
 
     def test_fallback_skipped_when_parent_already_set(self, issues_mixin):
         """If parent is already in fields, Cloud fallback should not override it."""
@@ -435,6 +510,37 @@ class TestCreateIssueEpicLink:
         assert fields["parent"] == {"key": "PARENT-1"}
 
 
+class TestCreateIssueUnresolvedEpicLink:
+    """PROPX-398: creating an issue must not silently drop the epic link."""
+
+    def test_create_issue_unresolved_epic_alias_raises_before_creating(
+        self, issues_mixin
+    ):
+        """Fail before the POST rather than create an issue with no epic link.
+
+        The alias is resolved while the create fields are built, so a
+        Server/DC instance with no discoverable Epic Link field now reports
+        the problem instead of creating an unlinked issue and returning it as
+        though the link had been made. Nothing is created, so the caller can
+        retry with the exact custom field ID named in the message.
+        """
+        issues_mixin.config.is_cloud = False
+        issues_mixin.get_project_issue_types.return_value = [
+            {"id": "10000", "name": "Story", "subtask": False},
+        ]
+        issues_mixin.get_field_ids_to_epic = MagicMock(return_value={})
+
+        with pytest.raises(ValueError, match="Could not resolve epic link alias"):
+            issues_mixin.create_issue(
+                project_key="PROJ",
+                summary="Linked to epic",
+                issue_type="Story",
+                epicKey="EPIC-1",
+            )
+
+        issues_mixin.jira.create_issue.assert_not_called()
+
+
 class TestUpdateIssueParent:
     """Tests for parent handling in update_issue."""
 
@@ -475,11 +581,19 @@ class TestUpdateIssueEpicLink:
     """Tests for epic link alias resolution in update_issue."""
 
     def test_update_issue_resolves_epic_alias(self, issues_mixin):
-        """update_issue should resolve epicKey alias to epic link custom field."""
+        """update_issue should resolve epicKey alias to epic link custom field.
+
+        The stored value is read back through ``EpicsMixin._epic_link_written``
+        (PROPX-398), which this standalone IssuesMixin harness does not
+        compose, so it is mocked here and asserted on: the alias resolution and
+        the verification are one contract, and a write that is not verified
+        must not be reported as done.
+        """
         issues_mixin.get_field_ids_to_epic = MagicMock(
             return_value={"epic_link": "customfield_10014"}
         )
         issues_mixin.jira.update_issue = MagicMock()
+        issues_mixin._epic_link_written = MagicMock(return_value=True)
         issues_mixin.jira.get_issue.return_value = {
             "key": "PROJ-1",
             "fields": {"summary": "Test"},
@@ -491,3 +605,26 @@ class TestUpdateIssueEpicLink:
         assert call_args is not None
         update_fields = call_args[1]["update"]["fields"]
         assert update_fields.get("customfield_10014") == "EPIC-1"
+        issues_mixin._epic_link_written.assert_called_once_with(
+            "PROJ-1", "customfield_10014", "EPIC-1"
+        )
+
+    def test_update_issue_unverified_epic_alias_raises(self, issues_mixin):
+        """An epic link write Jira did not store must not report success.
+
+        Measured on CHSTC-1102: the PUT answered 204, the field stayed null,
+        ``updated`` was unchanged and the changelog stayed empty, yet the
+        caller was told the link had been made.
+        """
+        issues_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014"}
+        )
+        issues_mixin.jira.update_issue = MagicMock()
+        issues_mixin._epic_link_written = MagicMock(return_value=False)
+        issues_mixin.jira.get_issue.return_value = {
+            "key": "PROJ-1",
+            "fields": {"summary": "Test"},
+        }
+
+        with pytest.raises(ValueError, match="does not hold epic key EPIC-1"):
+            issues_mixin.update_issue(issue_key="PROJ-1", epicKey="EPIC-1")

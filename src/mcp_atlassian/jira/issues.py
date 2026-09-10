@@ -700,7 +700,15 @@ class IssuesMixin(
                         ]
 
             # Resolve epic link aliases (epicKey, epic_link, etc.) before
-            # kwargs_copy so the alias is not double-processed.
+            # kwargs_copy so the alias is not double-processed. This raises if
+            # the alias cannot be resolved to a field, so no issue is created
+            # that silently lacks the requested epic link.
+            #
+            # The returned field is deliberately not read back here, unlike in
+            # update_issue: a create rejects a field that is not on the create
+            # screen with an error rather than accepting it and storing
+            # nothing, which is the PROPX-398 shape. Verifying the created
+            # issue as well is a follow-up (see _verify_epic_link_written).
             self._prepare_epic_link_fields(fields, kwargs)
 
             # Make a copy of kwargs to preserve original values for two-step Epic creation
@@ -955,7 +963,7 @@ class IssuesMixin(
 
     def _prepare_epic_link_fields(
         self, fields: dict[str, Any], kwargs: dict[str, Any]
-    ) -> None:
+    ) -> tuple[str, str] | None:
         """Resolve epic link aliases (epicKey, epic_link, etc.) to the actual custom field ID.
 
         Checks kwargs for known epic link aliases, discovers the real
@@ -964,9 +972,37 @@ class IssuesMixin(
         epic link custom field is discovered (team-managed projects use
         parent for epic relationships).
 
+        PROPX-398 -- a requested epic link that was never written must never be
+        reported as done. Two ways that used to happen on this path:
+
+        * No epic link custom field could be discovered (the normal case on a
+          Server/DC instance whose Epic Link field is not exposed by the
+          ``/field`` endpoint). This used to log a warning and return, leaving
+          *fields* untouched, so an update whose only requested change was the
+          epic link skipped its PUT entirely and ``update_issue`` still
+          returned the issue as updated. That branch now raises.
+        * The field was resolved and written, but Jira accepted the PUT without
+          storing anything -- measured on Server/DC as ``204 No Content`` with
+          the field still null, ``updated`` unchanged and an empty changelog.
+          Preparing a field cannot detect that, so this method now reports
+          which field it set and the caller reads the stored value back. See
+          :meth:`_verify_epic_link_written`, which delegates to
+          ``EpicsMixin._epic_link_written``.
+
         Args:
             fields: The issue fields dict (mutated in place).
             kwargs: Caller-provided keyword arguments (matched alias is popped).
+
+        Returns:
+            ``(field_id, epic_key)`` naming the field that was set from the
+            alias, for the caller to read back after the write; or None when no
+            alias was supplied, or when an explicit ``parent`` already in
+            *fields* deliberately wins over the Cloud fallback (nothing was set
+            from the alias, so there is nothing to verify).
+
+        Raises:
+            ValueError: If an epic link alias was supplied but no field could
+                be resolved to carry it, so the write would be a silent no-op.
         """
         epic_key_value = None
         matched_alias = None
@@ -977,7 +1013,7 @@ class IssuesMixin(
                 break
 
         if not epic_key_value:
-            return
+            return None
 
         # Discover the epic link custom field ID
         try:
@@ -993,18 +1029,87 @@ class IssuesMixin(
                 f"Set epic link field {epic_link_field_id}={epic_key_value} "
                 f"from alias '{matched_alias}'"
             )
-        elif self.config.is_cloud and "parent" not in fields:
-            fields["parent"] = {"key": epic_key_value}
-            logger.info(
-                f"No epic link field found, using parent field for "
-                f"epic link '{epic_key_value}' (Cloud fallback)"
-            )
-        else:
+            return epic_link_field_id, str(epic_key_value)
+
+        if self.config.is_cloud:
+            if "parent" not in fields:
+                fields["parent"] = {"key": epic_key_value}
+                logger.info(
+                    f"No epic link field found, using parent field for "
+                    f"epic link '{epic_key_value}' (Cloud fallback)"
+                )
+                return "parent", str(epic_key_value)
+            # An explicit parent passed alongside the alias wins: on Cloud it
+            # is the same relationship, and overriding it would discard the
+            # caller's own instruction.
             logger.warning(
-                f"Could not resolve epic link alias '{matched_alias}'="
-                f"{epic_key_value}. No epic link custom field discovered. "
-                f"Try using the exact custom field ID (e.g., customfield_10014)."
+                f"Ignoring epic link alias '{matched_alias}'={epic_key_value} "
+                f"because parent is already set to {fields['parent']}"
             )
+            return None
+
+        raise ValueError(
+            f"Could not resolve epic link alias '{matched_alias}'="
+            f"{epic_key_value}. No epic link custom field was discovered on "
+            "this Jira instance, so the epic link would not be written at all "
+            "while the update still reported success. Pass the exact epic link "
+            "custom field ID instead (for example customfield_10014, as "
+            "returned by jira_search_fields), or use jira_link_to_epic, which "
+            "tries each candidate field and verifies the stored value."
+        )
+
+    def _verify_epic_link_written(
+        self, issue_key: str, pending_epic_link: tuple[str, str]
+    ) -> None:
+        """Confirm an epic link requested through an alias is actually stored.
+
+        PROPX-398 -- a Jira PUT that changes nothing still answers ``204 No
+        Content``, so an accepted request is not evidence of a write. Measured
+        on Server/DC: a ``parent`` update was accepted while the field stayed
+        null, ``updated`` was unchanged and the changelog stayed empty, yet the
+        caller was told the link succeeded. Only the stored value settles it.
+
+        Args:
+            issue_key: The issue that was just updated.
+            pending_epic_link: ``(field_id, epic_key)`` as returned by
+                :meth:`_prepare_epic_link_fields`.
+
+        Raises:
+            ValueError: If the field does not hold the epic key after the
+                update, or could not be read back at all. An unreadable field
+                is reported as a failure on purpose: a loud false negative is
+                recoverable, and a silent false positive is exactly what
+                PROPX-398 was opened about.
+        """
+        field_id, epic_key = pending_epic_link
+        # EpicsMixin owns the single-field read-back, and reusing it keeps one
+        # definition of "the epic link is stored". It is not declared on
+        # EpicOperationsProto, so resolve it dynamically rather than assume
+        # the mixin composition: every JiraFetcher composes EpicsMixin, but
+        # IssuesMixin is also instantiated standalone in tests.
+        epic_link_written = getattr(self, "_epic_link_written", None)
+        if epic_link_written is None:
+            logger.warning(
+                f"No epic link read-back available on {type(self).__name__}, "
+                f"so field {field_id} on {issue_key} is NOT verified and the "
+                "epic link may not have been stored"
+            )
+            return
+
+        if epic_link_written(issue_key, field_id, epic_key):
+            logger.info(
+                f"Verified field {field_id} on {issue_key} holds epic {epic_key}"
+            )
+            return
+
+        raise ValueError(
+            f"The update of {issue_key} was accepted but field {field_id} "
+            f"does not hold epic key {epic_key} afterwards, so the epic link "
+            "was not stored. Any other requested field changes were applied. "
+            "Your Jira instance might use a different field for epic links, "
+            "or might not return this one to the API; jira_link_to_epic tries "
+            "each candidate field and verifies the stored value."
+        )
 
     def _validate_parent_clear_supported(self, value: Any) -> None:
         """Reject parent clearing on Jira Server/Data Center.
@@ -1217,7 +1322,11 @@ class IssuesMixin(
             JiraIssue model representing the updated issue
 
         Raises:
-            Exception: If there is an error updating the issue
+            ValueError: If there is an error updating the issue, including an
+                epic link alias that cannot be resolved to a field, or one
+                whose write Jira accepted without storing it (PROPX-398 -- an
+                epic link is only reported as done once the field reads back
+                as holding the epic key).
         """
         try:
             # Validate required fields
@@ -1238,9 +1347,13 @@ class IssuesMixin(
                     update_fields["description"]
                 )
 
-            # Resolve epic link aliases before processing kwargs
+            # Resolve epic link aliases before processing kwargs. The
+            # returned field is read back after the write, because Jira
+            # accepts an epic link PUT that stores nothing (PROPX-398).
             kwargs_mutable = dict(kwargs)
-            self._prepare_epic_link_fields(update_fields, kwargs_mutable)
+            pending_epic_link = self._prepare_epic_link_fields(
+                update_fields, kwargs_mutable
+            )
 
             # Jira Server/Data Center rejects the Cloud parent-clearing
             # payload. Validate before any update or follow-up REST request.
@@ -1258,9 +1371,12 @@ class IssuesMixin(
                     # Status changes are handled separately via transitions
                     # Add status to fields so _update_issue_with_status can find it
                     update_fields["status"] = value
-                    return self._update_issue_with_status(
+                    status_result = self._update_issue_with_status(
                         issue_key, update_fields, return_fields=return_fields
                     )
+                    if pending_epic_link is not None:
+                        self._verify_epic_link_written(issue_key, pending_epic_link)
+                    return status_result
 
                 elif key == "attachments":
                     # Handle attachments separately - they're not part of fields update
@@ -1336,6 +1452,9 @@ class IssuesMixin(
                     self.jira.update_issue(
                         issue_key=issue_key, update={"fields": update_fields}
                     )
+
+                if pending_epic_link is not None:
+                    self._verify_epic_link_written(issue_key, pending_epic_link)
 
             # Handle attachments if provided
             if "attachments" in kwargs and kwargs["attachments"]:

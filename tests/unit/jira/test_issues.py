@@ -1,7 +1,7 @@
 """Tests for the Jira Issues mixin."""
 
 from typing import Any
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -9,6 +9,7 @@ from requests.exceptions import HTTPError
 
 from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
 from mcp_atlassian.jira import JiraFetcher
+from mcp_atlassian.jira.config import JiraConfig
 from mcp_atlassian.jira.issues import IssuesMixin, logger
 from mcp_atlassian.models.jira import JiraIssue
 from tests.utils.mocks import setup_api3_passthrough_mocks
@@ -3226,3 +3227,315 @@ class TestMoveIssue:
 
         assert result.key == "DST-99"
         assert cloud_mixin.jira.get_issue.call_args_list[1].args == ("SRC-1",)
+
+
+class TestUpdateIssueEpicLinkVerification:
+    """PROPX-398 regression tests for the epic link alias on ``update_issue``.
+
+    ``jira_update_issue(additional_fields={"epic_link": ...})`` is the sibling
+    write path of ``jira_link_to_epic`` and the alternative the PROPX-398
+    evidence named as the confirmed working one, so it must not carry the same
+    failure class:
+
+    * A Jira PUT that stores nothing still answers ``204 No Content``
+      (measured on CHSTC-1102: field null, ``updated`` unchanged, empty
+      changelog), so the write has to be read back.
+    * An alias that resolves to no field used to log a warning and leave the
+      fields dict empty, so the PUT was skipped entirely while the tool still
+      returned the issue and reported the field as updated.
+
+    These tests drive the full ``JiraFetcher`` on purpose, so the read-back
+    really runs through ``EpicsMixin._epic_link_written`` instead of a mock of
+    it.
+    """
+
+    EPIC_LINK_FIELD = "customfield_10006"
+    EPIC_KEY = "EPIC-456"
+
+    @pytest.fixture
+    def server_mixin(self, mock_atlassian_jira: MagicMock) -> JiraFetcher:
+        """A JiraFetcher whose config reports Server/Data Center.
+
+        The shared ``jira_fetcher`` fixture points at
+        https://test.atlassian.net, so ``is_cloud`` is True everywhere else.
+        Every PROPX-398 measurement was taken on Server/DC, so these tests
+        keep that path exercised.
+        """
+        config = JiraConfig(
+            url="https://jira.example.com",
+            auth_type="pat",
+            personal_token="test-personal-token",
+        )
+        with patch("atlassian.Jira") as mock_jira_class:
+            mock_jira_class.return_value = mock_atlassian_jira
+            fetcher = JiraFetcher(config=config)
+
+        fetcher.jira = mock_atlassian_jira
+        # Clear only the call records and the preset issue payload; a blanket
+        # reset would also drop the mocked field definitions the shared
+        # fixture provides, which _process_additional_fields needs.
+        fetcher.jira.get_issue.reset_mock(return_value=True, side_effect=True)
+        fetcher.jira.update_issue.reset_mock(return_value=True, side_effect=True)
+        assert fetcher.config.is_cloud is False
+        fetcher.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": self.EPIC_LINK_FIELD}
+        )
+        return fetcher
+
+    @pytest.fixture
+    def cloud_mixin(self, jira_fetcher: JiraFetcher) -> JiraFetcher:
+        """A Cloud JiraFetcher with no Epic Link custom field discovered."""
+        jira_fetcher.config.url = "https://test.atlassian.net"
+        assert jira_fetcher.config.is_cloud is True
+        jira_fetcher.get_field_ids_to_epic = MagicMock(return_value={})
+        return jira_fetcher
+
+    @staticmethod
+    def _issue_payload(extra_fields: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build the full-issue payload returned by the post-update fetch."""
+        payload: dict[str, Any] = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Task"},
+            },
+        }
+        if extra_fields:
+            payload["fields"].update(extra_fields)
+        return payload
+
+    def test_accepted_but_unstored_epic_link_is_not_reported_as_success(
+        self, server_mixin: JiraFetcher
+    ):
+        """Raise instead of returning the issue when the field stays empty.
+
+        THE PROPX-398 REGRESSION TEST for this path. ``jira.update_issue`` is
+        left with no ``side_effect`` on purpose: the truthy MagicMock return
+        models the measured HTTP 204 that writes nothing. Against the previous
+        code this test fails, because ``update_issue`` fetched the issue and
+        returned it as updated.
+        """
+        server_mixin.jira.get_issue.side_effect = [
+            # The verification read-back: the field is still empty.
+            {"key": "TEST-123", "fields": {self.EPIC_LINK_FIELD: None}},
+            self._issue_payload(),
+        ]
+
+        with pytest.raises(ValueError, match="does not hold epic key EPIC-456"):
+            server_mixin.update_issue(issue_key="TEST-123", epic_link=self.EPIC_KEY)
+
+        # The write was attempted exactly once, and the failure was detected
+        # before the result was built, so the full issue was never fetched.
+        server_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123",
+            update={"fields": {self.EPIC_LINK_FIELD: self.EPIC_KEY}},
+        )
+        assert server_mixin.jira.get_issue.call_count == 1
+
+    def test_verified_epic_link_write_returns_the_issue(
+        self, server_mixin: JiraFetcher
+    ):
+        """A write the read-back confirms returns the updated issue.
+
+        Pins the happy path, the narrow single-field verification read, and
+        the write payload, which is byte-identical to the measured working
+        ``jira_update_issue`` call.
+        """
+        server_mixin.jira.get_issue.side_effect = [
+            {"key": "TEST-123", "fields": {self.EPIC_LINK_FIELD: self.EPIC_KEY}},
+            self._issue_payload({self.EPIC_LINK_FIELD: self.EPIC_KEY}),
+        ]
+
+        result = server_mixin.update_issue(
+            issue_key="TEST-123", epic_link=self.EPIC_KEY
+        )
+
+        assert result.key == "TEST-123"
+        server_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123",
+            update={"fields": {self.EPIC_LINK_FIELD: self.EPIC_KEY}},
+        )
+        # The verification asks for just the one field; widening it into the
+        # final fetch would skip the response shaping that fetch performs.
+        assert server_mixin.jira.get_issue.call_args_list[0] == call(
+            "TEST-123", fields=self.EPIC_LINK_FIELD
+        )
+        assert server_mixin.jira.get_issue.call_count == 2
+
+    def test_unreadable_epic_link_field_is_reported_as_failure(
+        self, server_mixin: JiraFetcher
+    ):
+        """A field that cannot be read back is a failure, not a success.
+
+        Deliberate direction, worth stating out loud: on an instance where the
+        Epic Link field is writable but hidden from the reader (field-level
+        security, or a proxy stripping fields) a genuine success is reported as
+        an error. A loud false negative is recoverable; the silent false
+        positive is what PROPX-398 was opened about.
+        """
+        server_mixin.jira.get_issue.side_effect = RuntimeError("field not visible")
+
+        with pytest.raises(ValueError, match="does not hold epic key EPIC-456"):
+            server_mixin.update_issue(issue_key="TEST-123", epic_link=self.EPIC_KEY)
+
+    def test_unresolved_epic_alias_raises_instead_of_skipping_the_write(
+        self, server_mixin: JiraFetcher
+    ):
+        """No discoverable epic link field must not read as a successful update.
+
+        This is the measured Server/DC shape: ``get_field_ids_to_epic()``
+        yields no ``epic_link``, the old code logged 'Could not resolve epic
+        link alias', left the fields dict empty so the PUT was skipped
+        entirely, and ``update_issue`` still returned the issue while the
+        server tool reported ``fields_updated``.
+        """
+        server_mixin.get_field_ids_to_epic = MagicMock(return_value={})
+        server_mixin.jira.get_issue.return_value = self._issue_payload()
+
+        with pytest.raises(ValueError, match="Could not resolve epic link alias"):
+            server_mixin.update_issue(issue_key="TEST-123", epic_link=self.EPIC_KEY)
+
+        server_mixin.jira.update_issue.assert_not_called()
+
+    def test_unresolved_epic_alias_aborts_before_any_field_is_written(
+        self, server_mixin: JiraFetcher
+    ):
+        """The abort happens before the PUT, so no half-update is left behind.
+
+        The alias is resolved before the request is built, so an update that
+        also carried other fields writes nothing at all rather than applying
+        the rest and losing only the epic link.
+        """
+        server_mixin.get_field_ids_to_epic = MagicMock(return_value={})
+        server_mixin.jira.get_issue.return_value = self._issue_payload()
+
+        with pytest.raises(ValueError, match="Could not resolve epic link alias"):
+            server_mixin.update_issue(
+                issue_key="TEST-123",
+                summary="Renamed",
+                epic_link=self.EPIC_KEY,
+            )
+
+        server_mixin.jira.update_issue.assert_not_called()
+
+    def test_epic_link_is_verified_on_the_status_update_path(
+        self, server_mixin: JiraFetcher
+    ):
+        """An epic link sent alongside a status change is verified too.
+
+        ``update_issue`` returns early through ``_update_issue_with_status``
+        when a status is requested, and that branch writes the same fields, so
+        skipping the read-back there would leave the defect reachable by adding
+        one unrelated argument.
+        """
+        server_mixin._update_issue_with_status = MagicMock(
+            return_value=JiraIssue(id="12345", key="TEST-123", summary="Test Issue")
+        )
+        server_mixin.jira.get_issue.return_value = {
+            "key": "TEST-123",
+            "fields": {self.EPIC_LINK_FIELD: None},
+        }
+
+        with pytest.raises(ValueError, match="does not hold epic key EPIC-456"):
+            server_mixin.update_issue(
+                issue_key="TEST-123",
+                epic_link=self.EPIC_KEY,
+                status="In Progress",
+            )
+
+        server_mixin._update_issue_with_status.assert_called_once()
+
+    def test_ordinary_update_does_not_read_anything_back(
+        self, server_mixin: JiraFetcher
+    ):
+        """NEGATIVE CONTROL: no epic alias, no extra request.
+
+        The verification read must be scoped to an epic link requested through
+        an alias; every other update keeps exactly one GET, the one that builds
+        the result.
+        """
+        server_mixin.jira.get_issue.return_value = self._issue_payload()
+
+        result = server_mixin.update_issue(issue_key="TEST-123", summary="Renamed")
+
+        assert result.key == "TEST-123"
+        assert server_mixin.jira.get_issue.call_count == 1
+        server_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123", update={"fields": {"summary": "Renamed"}}
+        )
+
+    def test_explicit_parent_field_is_not_verified_as_an_epic_link(
+        self, server_mixin: JiraFetcher
+    ):
+        """NEGATIVE CONTROL: ``parent=`` on its own is not an epic alias.
+
+        Only a field this code set *from an epic alias* is read back. A caller
+        who writes ``parent`` (or the raw custom field ID) directly gets the
+        unchanged single-request behaviour.
+        """
+        server_mixin.jira.get_issue.return_value = self._issue_payload()
+
+        server_mixin.update_issue(issue_key="TEST-123", parent="EPIC-456")
+
+        assert server_mixin.jira.get_issue.call_count == 1
+
+    def test_cloud_parent_fallback_is_verified_by_read_back(
+        self, cloud_mixin: JiraFetcher
+    ):
+        """The Cloud ``parent`` fallback is verified like any other candidate.
+
+        Cloud team-managed projects carry the epic relationship on ``parent``,
+        and the stored value comes back as a nested object, so the read-back
+        has to match ``{"key": ...}`` and not just a bare string.
+        """
+        cloud_mixin.jira.get_issue.side_effect = [
+            {"key": "TEST-123", "fields": {"parent": {"key": self.EPIC_KEY}}},
+            self._issue_payload(),
+        ]
+
+        result = cloud_mixin.update_issue(issue_key="TEST-123", epic_link=self.EPIC_KEY)
+
+        assert result.key == "TEST-123"
+        cloud_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123",
+            update={"fields": {"parent": {"key": self.EPIC_KEY}}},
+        )
+        assert cloud_mixin.jira.get_issue.call_args_list[0] == call(
+            "TEST-123", fields="parent"
+        )
+
+    def test_cloud_parent_fallback_that_stores_nothing_raises(
+        self, cloud_mixin: JiraFetcher
+    ):
+        """The measured no-op PUT was a ``parent`` write, so pin it here too."""
+        cloud_mixin.jira.get_issue.side_effect = [
+            {"key": "TEST-123", "fields": {"parent": None}},
+            self._issue_payload(),
+        ]
+
+        with pytest.raises(ValueError, match="field parent does not hold epic key"):
+            cloud_mixin.update_issue(issue_key="TEST-123", epic_link=self.EPIC_KEY)
+
+    def test_verification_is_skipped_loudly_without_the_epics_read_back(
+        self, server_mixin: JiraFetcher, caplog
+    ):
+        """The read-back is resolved from the mixin composition, and says so.
+
+        ``EpicsMixin._epic_link_written`` is not declared on
+        ``EpicOperationsProto``, so ``IssuesMixin`` looks it up dynamically. A
+        composition without ``EpicsMixin`` therefore cannot verify anything --
+        that must be a warning in the log rather than a silent downgrade back
+        to the PROPX-398 behaviour.
+        """
+        server_mixin._epic_link_written = None
+        server_mixin.jira.get_issue.return_value = self._issue_payload()
+
+        with caplog.at_level("WARNING", logger=logger.name):
+            result = server_mixin.update_issue(
+                issue_key="TEST-123", epic_link=self.EPIC_KEY
+            )
+
+        assert result.key == "TEST-123"
+        assert "is NOT verified" in caplog.text
