@@ -32,6 +32,7 @@ from jinja2 import Environment, FileSystemLoader
 CATEGORY_TOOLS: dict[str, list[str]] = {
     "jira-issues": [
         "jira_get_issue",
+        "jira_get_rendered_html",
         "jira_create_issue",
         "jira_update_issue",
         "jira_delete_issue",

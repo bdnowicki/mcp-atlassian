@@ -4,15 +4,23 @@ THE VERIFICATION RULE THIS FILE EXISTS FOR: the stored field LIES. A writer
 that compares strings passes while the render is broken, so any claim about
 real Jira behaviour has to be checked on rendered HTML.
 
-Rendered HTML is reachable only over raw REST: POST a comment carrying raw
-wiki markup, then GET
-``/rest/api/2/issue/{key}/comment/{id}?expand=renderedBody``. Note that
-``jira_get_issue`` with ``expand=renderedFields`` does NOT return rendered
-HTML - it returns the description converted back to Markdown.
+Rendered HTML now has a first-class read: ``jira_get_rendered_html``
+(``IssuesMixin.get_rendered_html``), added because the probes below had to
+hand-roll a REST client to see it at all. ``jira_get_issue`` with
+``expand=renderedFields`` is still NOT rendered HTML - the payload is
+fetched and dropped, and the description comes back converted to Markdown.
+
+The probes below deliberately keep using raw REST - POST a comment carrying
+raw wiki markup, then GET
+``/rest/api/2/issue/{key}/comment/{id}?expand=renderedBody`` - because a
+test cannot verify the read path with the read path. Their independence is
+the point, and ``TestGetRenderedHtmlMatchesRawRest`` is what ties the two
+channels together, comparing them byte-for-byte on a live instance.
 
 WHAT IS ENFORCED WHERE - read this before trusting a green suite
 ----------------------------------------------------------------
-``TestJiraWikiRender`` and ``TestJiraEpicLinkStored`` need a live Jira
+``TestJiraWikiRender``, ``TestJiraEpicLinkStored`` and
+``TestGetRenderedHtmlMatchesRawRest`` need a live Jira
 Server/DC instance, so they are skipped three times over: the ``integration``
 marker needs ``--integration`` (registered in tests/integration/conftest.py),
 the autouse fixture needs ``--use-real-data``, and the credentials have to be
@@ -169,9 +177,12 @@ HTML on a scratch project before merge. The stored field lies: a writer that
 only compares strings passes while the render is broken.
 
 - `jira_get_issue` with `expand=renderedFields` is NOT rendered HTML - it
-  returns the description converted back to Markdown. Rendered HTML is
-  reachable only over raw REST: POST the wiki markup as a comment, then GET
-  `/rest/api/2/issue/{key}/comment/{id}?expand=renderedBody`.
+  returns the description converted back to Markdown. Use
+  `jira_get_rendered_html`, which returns Jira's HTML verbatim. The live
+  probes still measure the renderer over raw REST instead - POST the wiki
+  markup as a comment, then GET
+  `/rest/api/2/issue/{key}/comment/{id}?expand=renderedBody` - because a
+  test cannot verify the read path with the read path.
 - Run the live checks (needs `JIRA_URL` and `JIRA_PERSONAL_TOKEN` exported):
 
   ```bash
@@ -595,6 +606,85 @@ def _require_env(name: str) -> str:
     return value
 
 
+@pytest.fixture
+def base_url():
+    """Base URL of the configured Jira Server/DC instance."""
+    return _require_env("JIRA_URL").rstrip("/")
+
+
+@pytest.fixture
+def rest():
+    """Raw REST session against the configured Jira Server/DC instance."""
+    token = _require_env("JIRA_PERSONAL_TOKEN")
+
+    import requests
+
+    verify = os.getenv("JIRA_SSL_VERIFY", "true").lower() not in (
+        "false",
+        "0",
+        "no",
+    )
+    if not verify:
+        import urllib3
+
+        urllib3.disable_warnings()
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+    )
+    session.verify = verify
+    return session
+
+
+@pytest.fixture
+def issue_key():
+    """Scratch issue that the render probes comment on."""
+    return os.getenv("JIRA_TEST_ISSUE_KEY", "CHSTC-1101")
+
+
+@pytest.fixture
+def render_wiki(rest, base_url, issue_key):
+    """Return a callable that renders raw wiki markup to HTML.
+
+    Posts the markup as a comment, reads ``renderedBody`` back, then
+    deletes the comment so the scratch issue is left as it was found.
+    """
+    created: list[str] = []
+
+    def _render(wiki: str) -> str:
+        response = rest.post(
+            f"{base_url}/rest/api/2/issue/{issue_key}/comment",
+            data=json.dumps({"body": wiki}),
+            timeout=60,
+        )
+        response.raise_for_status()
+        comment_id = response.json()["id"]
+        created.append(comment_id)
+        rendered = rest.get(
+            f"{base_url}/rest/api/2/issue/{issue_key}/comment/{comment_id}",
+            params={"expand": "renderedBody"},
+            timeout=60,
+        )
+        rendered.raise_for_status()
+        return rendered.json()["renderedBody"]
+
+    yield _render
+
+    for comment_id in created:
+        try:
+            rest.delete(
+                f"{base_url}/rest/api/2/issue/{issue_key}/comment/{comment_id}",
+                timeout=60,
+            )
+        except Exception as exc:  # best-effort cleanup only
+            print(f"could not delete scratch comment {comment_id}: {exc}")
+
+
 @pytest.mark.integration
 class TestJiraWikiRender:
     """Assert PROPX-398's write-path output against the real wiki renderer."""
@@ -611,81 +701,6 @@ class TestJiraWikiRender:
                 "a change to preprocessing/jira.py: "
                 f"{LIVE_RENDER_COMMAND}"
             )
-
-    @pytest.fixture
-    def base_url(self):
-        """Base URL of the configured Jira Server/DC instance."""
-        return _require_env("JIRA_URL").rstrip("/")
-
-    @pytest.fixture
-    def rest(self):
-        """Raw REST session against the configured Jira Server/DC instance."""
-        token = _require_env("JIRA_PERSONAL_TOKEN")
-
-        import requests
-
-        verify = os.getenv("JIRA_SSL_VERIFY", "true").lower() not in (
-            "false",
-            "0",
-            "no",
-        )
-        if not verify:
-            import urllib3
-
-            urllib3.disable_warnings()
-
-        session = requests.Session()
-        session.headers.update(
-            {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
-        )
-        session.verify = verify
-        return session
-
-    @pytest.fixture
-    def issue_key(self):
-        """Scratch issue that the render probes comment on."""
-        return os.getenv("JIRA_TEST_ISSUE_KEY", "CHSTC-1101")
-
-    @pytest.fixture
-    def render_wiki(self, rest, base_url, issue_key):
-        """Return a callable that renders raw wiki markup to HTML.
-
-        Posts the markup as a comment, reads ``renderedBody`` back, then
-        deletes the comment so the scratch issue is left as it was found.
-        """
-        created: list[str] = []
-
-        def _render(wiki: str) -> str:
-            response = rest.post(
-                f"{base_url}/rest/api/2/issue/{issue_key}/comment",
-                data=json.dumps({"body": wiki}),
-                timeout=60,
-            )
-            response.raise_for_status()
-            comment_id = response.json()["id"]
-            created.append(comment_id)
-            rendered = rest.get(
-                f"{base_url}/rest/api/2/issue/{issue_key}/comment/{comment_id}",
-                params={"expand": "renderedBody"},
-                timeout=60,
-            )
-            rendered.raise_for_status()
-            return rendered.json()["renderedBody"]
-
-        yield _render
-
-        for comment_id in created:
-            try:
-                rest.delete(
-                    f"{base_url}/rest/api/2/issue/{issue_key}/comment/{comment_id}",
-                    timeout=60,
-                )
-            except Exception as exc:  # best-effort cleanup only
-                print(f"could not delete scratch comment {comment_id}: {exc}")
 
     @pytest.fixture
     def preprocessor(self):
@@ -1007,6 +1022,128 @@ class TestJiraEpicLinkStored:
 
         stored = jira_client.jira.get_issue(issue_key, fields=epic_link_field)
         assert stored["fields"][epic_link_field] == epic_key, stored["fields"]
+
+
+@pytest.mark.integration
+class TestGetRenderedHtmlMatchesRawRest:
+    """``get_rendered_html`` must be a faithful substitute for raw REST.
+
+    Every other live probe in this file reaches the renderer through a
+    hand-rolled ``requests`` session, because until now that was the only
+    way to see rendered HTML at all - ``get_issue`` with
+    ``expand="renderedFields"`` fetches the payload and then drops it, since
+    no model reads that key.
+
+    ``get_rendered_html`` exists to remove that hand-rolled step, and it is
+    only worth having if it returns the SAME bytes the raw channel does.
+    A near-match would be worse than nothing: it would make the tool a
+    third rendering to reconcile instead of one fewer, while looking like
+    verification. So these tests compare the two channels directly rather
+    than asserting that the output merely "looks like HTML".
+    """
+
+    @pytest.fixture(autouse=True)
+    def skip_without_real_data(self, request):
+        """Skip unless --use-real-data is provided."""
+        if not request.config.getoption("--use-real-data", default=False):
+            pytest.skip(
+                "Live rendered-read cross-check NOT run - it needs "
+                "--use-real-data and live Jira Server/DC credentials. "
+                "Nothing offline can compare the two channels, so this skip "
+                "is an unchecked claim, not a pass. Run: "
+                f"{LIVE_RENDER_COMMAND}"
+            )
+
+    @pytest.fixture
+    def fetcher(self):
+        """Real Jira client built from the environment."""
+        _require_env("JIRA_URL")
+        return JiraFetcher(config=JiraConfig.from_env())
+
+    def test_description_matches_the_raw_rest_channel(
+        self, fetcher, rest, base_url, issue_key
+    ):
+        """Byte-for-byte, not "equivalent"."""
+        raw = rest.get(
+            f"{base_url}/rest/api/2/issue/{issue_key}",
+            params={"expand": "renderedFields", "fields": "description"},
+            timeout=60,
+        )
+        raw.raise_for_status()
+        expected = raw.json()["renderedFields"]["description"]
+
+        result = fetcher.get_rendered_html(issue_key)
+
+        assert result["fields"]["description"] == expected
+        assert result["key"] == issue_key
+        assert result["browse_url"].endswith(f"/browse/{issue_key}")
+
+    def test_comment_body_matches_the_raw_rest_channel(
+        self, fetcher, render_wiki, issue_key
+    ):
+        """The comment path is the one a writer actually verifies through.
+
+        ``render_wiki`` reads ``renderedBody`` off the comment resource,
+        while this method reads ``renderedFields.comment.comments[].body``
+        off the issue. They are two different endpoints, so agreement is a
+        measurement rather than an assumption.
+        """
+        wiki = (
+            "h3. Rendered read cross-check\n\n"
+            "*bold* and \\{not a macro} and {{monospace}}\n\n"
+            "* one\n* two\n"
+        )
+        expected = render_wiki(wiki)
+
+        result = fetcher.get_rendered_html(
+            issue_key, include_comments=True, comment_limit=1
+        )
+
+        assert len(result["comments"]) == 1
+        assert result["comments"][0]["body"] == expected
+
+    def test_get_issue_still_returns_markdown_for_the_same_field(
+        self, fetcher, issue_key
+    ):
+        """Pins the asymmetry that justifies two separate reads.
+
+        If ``get_issue`` ever starts returning HTML, or this method ever
+        starts returning Markdown, the two contracts have collided and a
+        caller cannot tell which shape they are asserting on.
+        """
+        rendered = fetcher.get_rendered_html(issue_key)["fields"]["description"]
+        markdown = fetcher.get_issue(issue_key, fields=["description"]).description
+
+        assert "<" in rendered, rendered[:200]
+        assert rendered != markdown
+
+    def test_expand_rendered_fields_on_get_issue_is_still_a_no_op(
+        self, fetcher, issue_key
+    ):
+        """The defect this tool works around, pinned against the instance.
+
+        ``expand="renderedFields"`` is accepted and changes nothing about
+        what ``get_issue`` returns. It is documented as a no-op in the tool
+        description; this measures that it still is, so the documentation
+        cannot quietly become wrong.
+        """
+        plain = fetcher.get_issue(issue_key, fields=["description"]).description
+        expanded = fetcher.get_issue(
+            issue_key, fields=["description"], expand="renderedFields"
+        ).description
+
+        assert expanded == plain
+
+    def test_missing_issue_raises_value_error(self, fetcher):
+        """A failed verification read must raise, not return an empty dict.
+
+        Measured 2026-09-10: without the explicit mapping this surfaced as a
+        bare ``HTTPError``, which the docstring did not promise.
+        """
+        project = os.getenv("JIRA_TEST_ISSUE_KEY", "CHSTC-1101").split("-")[0]
+
+        with pytest.raises(ValueError, match="not found"):
+            fetcher.get_rendered_html(f"{project}-999999")
 
 
 # The offline pins are enforced HERE, at import, and not only by the test

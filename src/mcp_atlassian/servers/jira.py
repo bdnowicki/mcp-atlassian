@@ -598,8 +598,12 @@ async def get_issue(
         str | None,
         Field(
             description=(
-                "(Optional) Fields to expand. Examples: 'renderedFields' (for rendered content), "
-                "'transitions' (for available status transitions), 'changelog' (for history)"
+                "(Optional) Fields to expand. Examples: "
+                "'transitions' (for available status transitions), "
+                "'changelog' (for history). "
+                "'renderedFields' is accepted but has no effect here — this "
+                "tool always returns Markdown; use jira_get_rendered_html "
+                "for the HTML Jira displays."
             ),
             default=None,
         ),
@@ -752,6 +756,90 @@ async def get_issue(
 
 @jira_mcp.tool(
     tags={"jira", "read", "toolset:jira_issues"},
+    annotations={"title": "Get Rendered HTML", "readOnlyHint": True},
+)
+async def get_rendered_html(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    fields: Annotated[
+        str,
+        Field(
+            description=(
+                "(Optional) Comma-separated fields to return rendered. Only "
+                "fields Jira actually renders come back (typically "
+                "'description' and 'environment' plus rendered custom fields); "
+                "a field Jira does not render is simply absent from the result."
+            ),
+            default="description",
+        ),
+    ] = "description",
+    include_comments: Annotated[
+        bool,
+        Field(
+            description="Whether to also return rendered comment bodies, newest last",
+            default=False,
+        ),
+    ] = False,
+    comment_limit: Annotated[
+        int,
+        Field(
+            description=(
+                "Maximum number of comments to include, newest kept "
+                "(0 for none). Ignored unless include_comments is true."
+            ),
+            default=10,
+            ge=0,
+            le=100,
+        ),
+    ] = 10,
+) -> str:
+    """Get Jira's own rendered HTML for an issue's fields and comments.
+
+    Use this to verify what Jira *displays* after a write. Every other
+    read tool converts wiki markup to Markdown on the way out, so none of
+    them can distinguish "the markup is wrong" from "the conversion is
+    wrong" — and the stored field is not evidence either, since it is
+    still markup. This returns the rendered HTML verbatim, unconverted.
+
+    Note that ``expand='renderedFields'`` on ``jira_get_issue`` does not
+    do this: the payload is fetched and then dropped, because no model
+    reads it. This tool exists because that read has to stay Markdown.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        fields: Comma-separated fields to return rendered.
+        include_comments: Whether to include rendered comment bodies.
+        comment_limit: Maximum number of comments, newest kept.
+
+    Returns:
+        JSON string with ``key``, ``browse_url``, a ``fields`` map of
+        field name to rendered HTML, and — when requested — ``comments``.
+
+    Raises:
+        ValueError: If the Jira client is not configured, the issue is not
+            found, or Jira returns nothing rendered (as on Cloud, where a
+            description is stored as ADF rather than wiki markup).
+    """
+    jira = await get_jira_fetcher(ctx)
+    result = await run_jira_fetcher_call(
+        jira.get_rendered_html,
+        issue_key=issue_key,
+        fields=fields,
+        include_comments=include_comments,
+        comment_limit=comment_limit,
+    )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(
+    tags={"jira", "read", "toolset:jira_issues"},
     annotations={"title": "Search Issues", "readOnlyHint": True},
 )
 async def search(
@@ -803,7 +891,9 @@ async def search(
         str | None,
         Field(
             description=(
-                "(Optional) fields to expand. Examples: 'renderedFields', 'transitions', 'changelog'"
+                "(Optional) fields to expand. Examples: 'transitions', "
+                "'changelog'. 'renderedFields' is accepted but has no effect "
+                "here — use jira_get_rendered_html for rendered HTML."
             ),
             default=None,
         ),

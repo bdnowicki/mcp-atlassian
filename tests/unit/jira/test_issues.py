@@ -1,5 +1,6 @@
 """Tests for the Jira Issues mixin."""
 
+import json
 from typing import Any
 from unittest.mock import ANY, MagicMock, call, patch
 
@@ -3539,3 +3540,417 @@ class TestUpdateIssueEpicLinkVerification:
 
         assert result.key == "TEST-123"
         assert "is NOT verified" in caplog.text
+
+
+class TestGetRenderedHtml:
+    """Tests for ``IssuesMixin.get_rendered_html``.
+
+    The contract under test is narrow and unusual for this codebase: the
+    payload must come back UNCONVERTED. Every other read in this file
+    asserts on Markdown, so the assertions here deliberately use HTML that
+    the Markdown conversion would visibly damage -- if a preprocessor ever
+    gets wired into this path, these tests fail rather than pass with
+    plausible-looking output.
+    """
+
+    #: Rendered HTML containing the exact constructs PROPX-398 was about:
+    #: a literal ``{``, asterisks, and a monospace span. Round-tripping
+    #: this through ``_clean_text`` would rewrite all three.
+    RENDERED_DESCRIPTION = (
+        "<h2>Probe</h2>\n\n<p>Braces {like this} and *stars* survive, "
+        "<tt>GET /rest/api/2/myself</tt> too.</p>\n\n"
+        '<ul class="alternate">\n\t<li>one</li>\n\t<li>two</li>\n</ul>'
+    )
+
+    @pytest.fixture
+    def mixin(self, jira_fetcher: JiraFetcher) -> JiraFetcher:
+        """A fetcher whose ``jira.get_issue`` is the only mocked surface."""
+        return jira_fetcher
+
+    def _payload(
+        self,
+        *,
+        key: str = "TEST-123",
+        rendered: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if rendered is None:
+            rendered = {"description": self.RENDERED_DESCRIPTION}
+        return {"key": key, "renderedFields": rendered}
+
+    @staticmethod
+    def _comment(index: int) -> dict[str, Any]:
+        return {
+            "id": str(1000 + index),
+            "author": {"displayName": f"Author {index}"},
+            "created": f"2026-09-0{index}T10:00:00.000+0000",
+            "updated": f"2026-09-0{index}T11:00:00.000+0000",
+            "body": f"<p>comment {index}</p>",
+            "self": "https://test.atlassian.net/rest/api/2/issue/1/comment/1",
+        }
+
+    # -- the core promise ---------------------------------------------------
+
+    def test_rendered_html_is_returned_byte_identical(self, mixin: JiraFetcher):
+        """The rendered field must arrive exactly as Jira sent it."""
+        mixin.jira.get_issue.return_value = self._payload()
+
+        result = mixin.get_rendered_html("TEST-123")
+
+        assert result["fields"]["description"] == self.RENDERED_DESCRIPTION
+
+    def test_rendered_html_is_not_run_through_the_markdown_conversion(
+        self, mixin: JiraFetcher
+    ):
+        """Guard against a preprocessor being wired into this path later.
+
+        ``_clean_text`` is what makes every other read return Markdown. If
+        it ever starts touching this one the payload stops being evidence,
+        so assert it is never called rather than only assert on the output.
+        """
+        mixin.jira.get_issue.return_value = self._payload()
+        with patch.object(
+            mixin, "_clean_text", side_effect=AssertionError("must not convert")
+        ):
+            result = mixin.get_rendered_html("TEST-123")
+
+        assert result["fields"]["description"] == self.RENDERED_DESCRIPTION
+
+    def test_expand_and_fields_are_sent_as_jira_expects(self, mixin: JiraFetcher):
+        """``renderedFields`` has to be requested, or there is nothing to read."""
+        mixin.jira.get_issue.return_value = self._payload()
+
+        mixin.get_rendered_html("TEST-123", fields="description,environment")
+
+        mixin.jira.get_issue.assert_called_once_with(
+            "TEST-123",
+            expand="renderedFields",
+            fields="description,environment",
+        )
+
+    def test_browse_url_is_built_from_the_configured_instance(self, mixin: JiraFetcher):
+        mixin.jira.get_issue.return_value = self._payload()
+
+        result = mixin.get_rendered_html("TEST-123")
+
+        assert result["browse_url"] == "https://test.atlassian.net/browse/TEST-123"
+
+    def test_browse_url_does_not_double_the_slash(self, jira_config_factory):
+        """A trailing slash on JIRA_URL must not produce ``//browse``."""
+        with patch("atlassian.Jira") as jira_class:
+            fetcher = JiraFetcher(
+                config=jira_config_factory(url="https://test.example/")
+            )
+            fetcher.jira = jira_class.return_value
+        fetcher.jira.get_issue.return_value = self._payload()
+
+        result = fetcher.get_rendered_html("TEST-123")
+
+        assert result["browse_url"] == "https://test.example/browse/TEST-123"
+
+    # -- field selection ----------------------------------------------------
+
+    def test_unrendered_field_is_omitted_rather_than_faked(self, mixin: JiraFetcher):
+        """Absence is information: Jira renders only some fields.
+
+        Returning ``""`` for a field Jira never rendered would be
+        indistinguishable from a field that rendered as nothing, and a
+        caller verifying a write would read the wrong conclusion.
+        """
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={"description": self.RENDERED_DESCRIPTION}
+        )
+
+        result = mixin.get_rendered_html("TEST-123", fields="description,summary")
+
+        assert set(result["fields"]) == {"description"}
+
+    def test_field_names_are_stripped_and_blanks_dropped(self, mixin: JiraFetcher):
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={"description": "<p>d</p>", "environment": "<p>e</p>"}
+        )
+
+        result = mixin.get_rendered_html(
+            "TEST-123", fields=" description , , environment "
+        )
+
+        mixin.jira.get_issue.assert_called_once_with(
+            "TEST-123",
+            expand="renderedFields",
+            fields="description,environment",
+        )
+        assert set(result["fields"]) == {"description", "environment"}
+
+    def test_empty_fields_string_falls_back_to_description(self, mixin: JiraFetcher):
+        """An empty selection must not turn into ``fields=""``.
+
+        Jira reads an empty ``fields`` parameter as "no fields", which would
+        return a payload with nothing to assert on.
+        """
+        mixin.jira.get_issue.return_value = self._payload()
+
+        result = mixin.get_rendered_html("TEST-123", fields="  ,  ")
+
+        mixin.jira.get_issue.assert_called_once_with(
+            "TEST-123", expand="renderedFields", fields="description"
+        )
+        assert result["fields"]["description"] == self.RENDERED_DESCRIPTION
+
+    # -- comments -----------------------------------------------------------
+
+    def test_comments_are_absent_unless_requested(self, mixin: JiraFetcher):
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={
+                "description": "<p>d</p>",
+                "comment": {"comments": [self._comment(1)]},
+            }
+        )
+
+        result = mixin.get_rendered_html("TEST-123")
+
+        assert "comments" not in result
+        assert mixin.jira.get_issue.call_args.kwargs["fields"] == "description"
+
+    def test_requesting_comments_adds_the_comment_field(self, mixin: JiraFetcher):
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={"description": "<p>d</p>", "comment": {"comments": []}}
+        )
+
+        result = mixin.get_rendered_html("TEST-123", include_comments=True)
+
+        assert mixin.jira.get_issue.call_args.kwargs["fields"] == "description,comment"
+        assert result["comments"] == []
+
+    def test_comment_field_is_not_duplicated_when_asked_for_explicitly(
+        self, mixin: JiraFetcher
+    ):
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={"comment": {"comments": []}}
+        )
+
+        mixin.get_rendered_html("TEST-123", fields="comment", include_comments=True)
+
+        assert mixin.jira.get_issue.call_args.kwargs["fields"] == "comment"
+
+    def test_newest_comments_are_the_ones_kept(self, mixin: JiraFetcher):
+        """Jira orders comments oldest-first; the newest are what matter."""
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={
+                "description": "<p>d</p>",
+                "comment": {"comments": [self._comment(i) for i in (1, 2, 3)]},
+            }
+        )
+
+        result = mixin.get_rendered_html(
+            "TEST-123", include_comments=True, comment_limit=2
+        )
+
+        assert [c["id"] for c in result["comments"]] == ["1002", "1003"]
+
+    def test_comment_limit_zero_returns_no_comments(self, mixin: JiraFetcher):
+        """A bare ``entries[-0:]`` is ``entries[0:]`` -- i.e. everything.
+
+        This is the whole reason the implementation guards on ``> 0``, so
+        pin it: a limit of zero must mean zero, not "all of them".
+        """
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={
+                "description": "<p>d</p>",
+                "comment": {"comments": [self._comment(i) for i in (1, 2, 3)]},
+            }
+        )
+
+        result = mixin.get_rendered_html(
+            "TEST-123", include_comments=True, comment_limit=0
+        )
+
+        assert result["comments"] == []
+
+    @pytest.mark.parametrize("limit", [None, "all"])
+    def test_unbounded_comment_limit_returns_every_comment(
+        self, mixin: JiraFetcher, limit
+    ):
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={
+                "description": "<p>d</p>",
+                "comment": {"comments": [self._comment(i) for i in (1, 2, 3)]},
+            }
+        )
+
+        result = mixin.get_rendered_html(
+            "TEST-123", include_comments=True, comment_limit=limit
+        )
+
+        assert [c["id"] for c in result["comments"]] == ["1001", "1002", "1003"]
+
+    def test_comment_bodies_are_rendered_html_and_metadata_is_flattened(
+        self, mixin: JiraFetcher
+    ):
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={
+                "description": "<p>d</p>",
+                "comment": {"comments": [self._comment(1)]},
+            }
+        )
+
+        result = mixin.get_rendered_html("TEST-123", include_comments=True)
+
+        assert result["comments"] == [
+            {
+                "id": "1001",
+                "author": "Author 1",
+                "created": "2026-09-01T10:00:00.000+0000",
+                "updated": "2026-09-01T11:00:00.000+0000",
+                "body": "<p>comment 1</p>",
+            }
+        ]
+
+    def test_comment_without_an_author_does_not_raise(self, mixin: JiraFetcher):
+        """Jira omits ``author`` on comments left by a deleted user."""
+        entry = self._comment(1)
+        entry["author"] = None
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={"description": "<p>d</p>", "comment": {"comments": [entry]}}
+        )
+
+        result = mixin.get_rendered_html("TEST-123", include_comments=True)
+
+        assert result["comments"][0]["author"] is None
+
+    @pytest.mark.parametrize(
+        "container",
+        [
+            {},
+            {"comments": None},
+            {"comments": "not-a-list"},
+            None,
+            "not-a-dict",
+        ],
+        ids=["empty", "null-list", "string-list", "null", "string"],
+    )
+    def test_malformed_comment_container_yields_an_empty_list(
+        self, mixin: JiraFetcher, container
+    ):
+        """A shape surprise must not crash a verification read."""
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={"description": "<p>d</p>", "comment": container}
+        )
+
+        result = mixin.get_rendered_html("TEST-123", include_comments=True)
+
+        assert result["comments"] == []
+
+    def test_non_dict_comment_entries_are_dropped(self, mixin: JiraFetcher):
+        mixin.jira.get_issue.return_value = self._payload(
+            rendered={
+                "description": "<p>d</p>",
+                "comment": {"comments": ["junk", self._comment(1), None]},
+            }
+        )
+
+        result = mixin.get_rendered_html(
+            "TEST-123", include_comments=True, comment_limit=None
+        )
+
+        assert [c["id"] for c in result["comments"]] == ["1001"]
+
+    # -- payload shapes -----------------------------------------------------
+
+    def test_string_payload_is_parsed(self, mixin: JiraFetcher):
+        """Jira Server/DC hands back a raw body string on some responses."""
+        mixin.jira.get_issue.return_value = json.dumps(self._payload())
+
+        result = mixin.get_rendered_html("TEST-123")
+
+        assert result["fields"]["description"] == self.RENDERED_DESCRIPTION
+
+    def test_unparseable_string_payload_raises(self, mixin: JiraFetcher):
+        mixin.jira.get_issue.return_value = "<html>proxy error</html>"
+
+        with pytest.raises(ValueError, match="unparseable"):
+            mixin.get_rendered_html("TEST-123")
+
+    @pytest.mark.parametrize(
+        "payload",
+        [None, {}, "", "   ", "{}", "null"],
+        ids=["none", "empty", "blank", "whitespace", "empty-json", "json-null"],
+    )
+    def test_empty_payload_reads_as_not_found(self, mixin: JiraFetcher, payload):
+        """Nothing-came-back must not be reported as a parse failure.
+
+        An empty body is what an unresolvable key produces. Calling it
+        unparseable would send the caller looking for a broken proxy, so
+        every shape of "empty" -- before or after JSON decoding -- has to
+        land on the same not-found message.
+        """
+        mixin.jira.get_issue.return_value = payload
+
+        with pytest.raises(ValueError, match="not found"):
+            mixin.get_rendered_html("TEST-123")
+
+    def test_unexpected_payload_type_raises_type_error(self, mixin: JiraFetcher):
+        mixin.jira.get_issue.return_value = [1, 2, 3]
+
+        with pytest.raises(TypeError, match="Unexpected return value type"):
+            mixin.get_rendered_html("TEST-123")
+
+    @pytest.mark.parametrize(
+        "rendered", [None, {}, "not-a-dict"], ids=["missing", "empty", "string"]
+    )
+    def test_missing_rendered_fields_raises_instead_of_returning_nothing(
+        self, mixin: JiraFetcher, rendered
+    ):
+        """An empty render must be loud.
+
+        Returning ``{"fields": {}}`` here would read as "Jira displays
+        nothing", which is exactly the false negative this method exists to
+        rule out. The message has to name the Cloud/ADF case, because that
+        is the one a caller cannot fix by retrying.
+        """
+        payload: dict[str, Any] = {"key": "TEST-123"}
+        if rendered is not None:
+            payload["renderedFields"] = rendered
+        mixin.jira.get_issue.return_value = payload
+
+        with pytest.raises(ValueError, match="no rendered fields"):
+            mixin.get_rendered_html("TEST-123")
+
+    # -- error mapping ------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("status_code", "expected_error"),
+        [
+            (401, MCPAtlassianAuthenticationError),
+            (403, MCPAtlassianAuthenticationError),
+            (404, ValueError),
+            (429, ValueError),
+        ],
+    )
+    def test_http_errors_map_the_same_way_as_get_issue(
+        self, mixin: JiraFetcher, status_code, expected_error
+    ):
+        """One error vocabulary across both reads.
+
+        A caller that moves from ``get_issue`` to this method to verify a
+        write should not have to learn a second set of exception types.
+        """
+        response = MagicMock()
+        response.status_code = status_code
+        mixin.jira.get_issue.side_effect = HTTPError(response=response)
+
+        with pytest.raises(expected_error):
+            mixin.get_rendered_html("TEST-404")
+
+    def test_other_http_errors_are_not_swallowed(self, mixin: JiraFetcher):
+        """A 500 is not a "not found" and must not be relabelled as one."""
+        response = MagicMock()
+        response.status_code = 500
+        mixin.jira.get_issue.side_effect = HTTPError(response=response)
+
+        with pytest.raises(HTTPError):
+            mixin.get_rendered_html("TEST-123")
+
+    def test_http_error_without_a_response_is_not_swallowed(self, mixin: JiraFetcher):
+        mixin.jira.get_issue.side_effect = HTTPError()
+
+        with pytest.raises(HTTPError):
+            mixin.get_rendered_html("TEST-123")

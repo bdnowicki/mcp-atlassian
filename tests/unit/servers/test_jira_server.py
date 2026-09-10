@@ -490,6 +490,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
         get_project_issues,
         get_project_versions,
         get_queue_issues,
+        get_rendered_html,
         get_request_type_fields,
         get_request_types,
         get_service_desk_for_project,
@@ -516,6 +517,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
 
     jira_sub_mcp = FastMCP(name="TestJiraSubMCP")
     jira_sub_mcp.add_tool(get_issue)
+    jira_sub_mcp.add_tool(get_rendered_html)
     jira_sub_mcp.add_tool(get_issue_dates)
     jira_sub_mcp.add_tool(get_issue_development_info)
     jira_sub_mcp.add_tool(get_issue_proforma_forms)
@@ -667,6 +669,109 @@ async def test_get_issue(jira_client, mock_jira_fetcher):
         properties=None,
         update_history=True,
     )
+
+
+#: Rendered HTML deliberately carrying the three things that break when
+#: something re-encodes this payload: a literal brace, bare asterisks and a
+#: non-ASCII character. Used by the ``jira_get_rendered_html`` tests below.
+_RENDERED_HTML = (
+    "<h2>Prób</h2>\n\n<p>Braces {like this} and *stars* survive.</p>\n"
+    "<ul><li>one</li></ul>"
+)
+
+
+@pytest.mark.anyio
+async def test_get_rendered_html(jira_client, mock_jira_fetcher):
+    """The tool must hand back Jira's HTML, not a converted rendering."""
+    mock_jira_fetcher.get_rendered_html.return_value = {
+        "key": "TEST-123",
+        "browse_url": "https://test.atlassian.net/browse/TEST-123",
+        "fields": {"description": _RENDERED_HTML},
+    }
+
+    response = await jira_client.call_tool(
+        "jira_get_rendered_html", {"issue_key": "TEST-123"}
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["fields"]["description"] == _RENDERED_HTML
+    assert content["browse_url"] == "https://test.atlassian.net/browse/TEST-123"
+    mock_jira_fetcher.get_rendered_html.assert_called_once_with(
+        issue_key="TEST-123",
+        fields="description",
+        include_comments=False,
+        comment_limit=10,
+    )
+
+
+@pytest.mark.anyio
+async def test_get_rendered_html_forwards_comment_options(
+    jira_client, mock_jira_fetcher
+):
+    mock_jira_fetcher.get_rendered_html.return_value = {
+        "key": "TEST-123",
+        "browse_url": "https://test.atlassian.net/browse/TEST-123",
+        "fields": {"description": "<p>d</p>", "environment": "<p>e</p>"},
+        "comments": [{"id": "1", "author": "A", "body": "<p>c</p>"}],
+    }
+
+    response = await jira_client.call_tool(
+        "jira_get_rendered_html",
+        {
+            "issue_key": "TEST-123",
+            "fields": "description,environment",
+            "include_comments": True,
+            "comment_limit": 1,
+        },
+    )
+
+    content = json.loads(response.content[0].text)
+    assert [c["id"] for c in content["comments"]] == ["1"]
+    mock_jira_fetcher.get_rendered_html.assert_called_once_with(
+        issue_key="TEST-123",
+        fields="description,environment",
+        include_comments=True,
+        comment_limit=1,
+    )
+
+
+@pytest.mark.anyio
+async def test_get_rendered_html_is_not_escaped_on_the_way_out(
+    jira_client, mock_jira_fetcher
+):
+    """The JSON envelope must not mangle the payload it is carrying.
+
+    ``ensure_ascii=False`` is what keeps the non-ASCII characters readable
+    instead of turning them into ``\\uXXXX`` escapes. A caller comparing
+    rendered HTML against what a browser shows would otherwise see a
+    difference this tool introduced itself.
+    """
+    mock_jira_fetcher.get_rendered_html.return_value = {
+        "key": "TEST-123",
+        "browse_url": "https://test.atlassian.net/browse/TEST-123",
+        "fields": {"description": _RENDERED_HTML},
+    }
+
+    response = await jira_client.call_tool(
+        "jira_get_rendered_html", {"issue_key": "TEST-123"}
+    )
+
+    raw = response.content[0].text
+    assert "Prób" in raw
+    assert "\\u" not in raw
+
+
+@pytest.mark.anyio
+async def test_get_rendered_html_propagates_a_missing_issue(
+    jira_client, mock_jira_fetcher
+):
+    """A failed verification read must fail, not return an empty result."""
+    mock_jira_fetcher.get_rendered_html.side_effect = ValueError(
+        "Issue TEST-404 not found. Verify the issue key and project access."
+    )
+
+    with pytest.raises(ToolError, match="not found"):
+        await jira_client.call_tool("jira_get_rendered_html", {"issue_key": "TEST-404"})
 
 
 @pytest.mark.anyio

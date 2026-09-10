@@ -324,6 +324,184 @@ class IssuesMixin(
             logger.error(f"Error retrieving issue {issue_key}: {error_msg}")
             raise Exception(f"Error retrieving issue {issue_key}: {error_msg}") from e
 
+    def get_rendered_html(
+        self,
+        issue_key: str,
+        fields: str = "description",
+        include_comments: bool = False,
+        comment_limit: int | str | None = 10,
+    ) -> dict[str, Any]:
+        """Fetch Jira's own rendered HTML for an issue's fields and comments.
+
+        Returns the rendered output VERBATIM. Nothing here routes through
+        ``_clean_text`` / ``clean_jira_text``, and that is the entire point:
+        every other read converts wiki markup to Markdown, so none of them
+        can answer "what does Jira actually display?".
+
+        Why this is its own method rather than an option on
+        :meth:`get_issue`. Passing ``expand="renderedFields"`` there fetches
+        the rendered payload and then drops it -- no model reads the
+        ``renderedFields`` key -- so the caller gets converted Markdown and
+        no error. Verifying a write therefore meant hand-rolling a REST
+        client with the instance credentials, which is how every claim in
+        PROPX-398 had to be measured. A stored field can read back
+        byte-identical over REST and still render as torn paragraphs, a
+        swallowed list and a heading demoted to literal text, so the
+        rendered HTML is the only trustworthy signal and it needs a
+        first-class way in.
+
+        The two contracts are incompatible on purpose and must not be
+        merged: ``get_issue`` promises Markdown, this promises Jira's HTML.
+        One tool returning either shape depending on a flag is how a caller
+        ends up asserting on the wrong one.
+
+        Args:
+            issue_key: The issue key, e.g. 'PROJ-123'.
+            fields: Comma-separated field names to return rendered. A field
+                Jira does not render is omitted rather than faked, so the
+                absence of a key is itself information.
+            include_comments: Also return each comment's rendered body.
+            comment_limit: Maximum number of comments to return. Jira orders
+                them oldest-first and the newest are kept, matching
+                :meth:`_get_issue_comments_if_needed`. ``None`` or ``"all"``
+                returns every comment; ``0`` returns none.
+
+        Returns:
+            A dict carrying the issue key, its browse URL, a ``fields``
+            mapping of field name to rendered HTML, and -- only when
+            requested -- a ``comments`` list of dicts with id, author,
+            created, updated and the rendered ``body``.
+
+        Raises:
+            ValueError: If the issue is not found (HTTP 404), the instance
+                is rate limiting (429), the payload cannot be parsed, or the
+                instance returned no ``renderedFields`` at all. That last
+                case raises instead of returning an empty result, because an
+                empty render reads as "nothing to display" and would let
+                this method lie in exactly the way it exists to prevent.
+            MCPAtlassianAuthenticationError: On HTTP 401 or 403.
+            TypeError: If the Jira API returns an unexpected payload type.
+        """
+        requested = [name.strip() for name in fields.split(",") if name.strip()]
+        if not requested:
+            requested = ["description"]
+        limit = self._normalize_comment_limit(comment_limit)
+
+        query_fields = list(requested)
+        if include_comments and "comment" not in query_fields:
+            query_fields.append("comment")
+
+        try:
+            raw = self.jira.get_issue(
+                issue_key,
+                expand="renderedFields",
+                fields=",".join(query_fields),
+            )
+        except HTTPError as http_err:
+            # Deliberately the same mapping :meth:`get_issue` applies, so a
+            # caller moving between the Markdown read and this one sees one
+            # error vocabulary rather than two.
+            status_code = (
+                http_err.response.status_code if http_err.response is not None else None
+            )
+            if status_code in (401, 403):
+                msg = (
+                    f"Authentication failed for Jira API ({status_code}). "
+                    "Token may be expired or invalid. Please verify credentials."
+                )
+                logger.error(msg)
+                raise MCPAtlassianAuthenticationError(msg) from http_err
+            if status_code == 404:
+                msg = (
+                    f"Issue {issue_key} not found. "
+                    "Verify the issue key and project access."
+                )
+                logger.error(msg)
+                raise ValueError(msg) from http_err
+            if status_code == 429:
+                from mcp_atlassian.utils.http import format_rate_limit_error
+
+                msg = format_rate_limit_error(http_err, service="Jira")
+                logger.error(msg)
+                raise ValueError(msg) from http_err
+            raise
+        if isinstance(raw, str):
+            # atlassian-python-api hands back the raw body as a string on
+            # Jira Server/DC when ``response.json()`` fails; this repo
+            # already carries the same workaround on two other read paths.
+            stripped = raw.strip()
+            if not stripped:
+                # An empty body is what an unresolvable key produces, so it
+                # has to fall through to the not-found message below. Handing
+                # it to ``json.loads`` would report a parse failure instead
+                # and send the caller looking for a broken proxy.
+                raw = None
+            else:
+                try:
+                    raw = json.loads(stripped)
+                except (ValueError, TypeError) as e:
+                    msg = (
+                        f"Rendered read of {issue_key} returned an unparseable "
+                        "string payload, so nothing can be asserted about it."
+                    )
+                    raise ValueError(msg) from e
+        if not raw:
+            msg = (
+                f"Issue {issue_key} not found. Verify the issue key and project access."
+            )
+            raise ValueError(msg)
+        if not isinstance(raw, dict):
+            msg = f"Unexpected return value type from `jira.get_issue`: {type(raw)}"
+            logger.error(msg)
+            raise TypeError(msg)
+
+        rendered = raw.get("renderedFields")
+        if not isinstance(rendered, dict) or not rendered:
+            msg = (
+                f"Jira returned no rendered fields for {issue_key}. On Jira "
+                "Cloud a description is stored as ADF and comes back "
+                "pre-structured rather than rendered, so there may be "
+                "nothing to render; on Server/DC this means the expand was "
+                "refused."
+            )
+            raise ValueError(msg)
+
+        result: dict[str, Any] = {
+            "key": raw.get("key", issue_key),
+            "browse_url": f"{self.config.url.rstrip('/')}/browse/{issue_key}",
+            "fields": {name: rendered[name] for name in requested if name in rendered},
+        }
+
+        if include_comments:
+            container = rendered.get("comment")
+            entries: list[Any] = []
+            if isinstance(container, dict):
+                raw_entries = container.get("comments")
+                if isinstance(raw_entries, list):
+                    entries = [e for e in raw_entries if isinstance(e, dict)]
+            if limit is None:
+                kept = entries
+            elif limit > 0:
+                # Newest-last ordering from Jira, newest kept -- the same
+                # rule _get_issue_comments_if_needed applies. Guarding on
+                # ``> 0`` matters: a bare ``entries[-0:]`` is ``entries[0:]``
+                # and would return every comment for a limit of zero.
+                kept = entries[-limit:]
+            else:
+                kept = []
+            result["comments"] = [
+                {
+                    "id": entry.get("id"),
+                    "author": (entry.get("author") or {}).get("displayName"),
+                    "created": entry.get("created"),
+                    "updated": entry.get("updated"),
+                    "body": entry.get("body"),
+                }
+                for entry in kept
+            ]
+
+        return result
+
     def _normalize_comment_limit(self, comment_limit: int | str | None) -> int | None:
         """
         Normalize the comment limit to an integer or None.
