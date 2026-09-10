@@ -2715,16 +2715,33 @@ async def link_to_epic(
 ) -> str:
     """Link an existing issue to an epic.
 
+    The link is verified before success is reported: each candidate epic link
+    field is written and then read back, and the issue is only reported as
+    linked once the field actually stores the epic key. A Jira update that is
+    accepted but stores nothing (measured on Server/DC: HTTP 204 with the
+    field still null and an empty changelog) now fails loudly instead of
+    returning a success message. No substitute 'Relates to' issue link is
+    created as a consolation when the epic link cannot be established: either
+    the issue is linked to the epic, or this call raises.
+
     Args:
         ctx: The FastMCP context.
         issue_key: The key of the issue to link.
         epic_key: The key of the epic to link to.
 
     Returns:
-        JSON string representing the updated issue object.
+        JSON string representing the updated issue object. Returned only when
+        the epic link was read back from the issue after the update.
 
     Raises:
-        ValueError: If in read-only mode or Jira client unavailable.
+        ValueError: If in read-only mode, the Jira client is unavailable,
+            epic_key is not an epic, or no epic link field on the issue holds
+            the epic key after the update. The last case also covers a field
+            that cannot be read back (for example one hidden by a field-level
+            security scheme): an unverifiable link is reported as a failure on
+            purpose, because a false failure is recoverable while a false
+            success is not.
+        Exception: If the Jira API rejects the request.
     """
     jira = await get_jira_fetcher(ctx)
     issue = jira.link_issue_to_epic(issue_key, epic_key)

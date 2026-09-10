@@ -1069,6 +1069,83 @@ async def test_create_remote_issue_link(
 
 
 @pytest.mark.anyio
+async def test_link_to_epic_reports_success_only_for_a_verified_link(
+    jira_client, mock_jira_fetcher
+):
+    """The success sentence is emitted only when the mixin returns an issue.
+
+    Companion to test_link_to_epic_propagates_unverified_link_failure: pins the
+    happy path so the failure test cannot be "fixed" by removing the message.
+    """
+    linked_issue = MagicMock()
+    linked_issue.to_simplified_dict.return_value = {
+        "key": "TEST-123",
+        "epic_link": "EPIC-456",
+    }
+    mock_jira_fetcher.link_issue_to_epic.return_value = linked_issue
+
+    response = await jira_client.call_tool(
+        "jira_link_to_epic",
+        {"issue_key": "TEST-123", "epic_key": "EPIC-456"},
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["message"] == "Issue TEST-123 has been linked to epic EPIC-456."
+    assert content["issue"] == {"key": "TEST-123", "epic_link": "EPIC-456"}
+    mock_jira_fetcher.link_issue_to_epic.assert_called_once_with("TEST-123", "EPIC-456")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "raised",
+    [
+        pytest.param(
+            ValueError(
+                "Could not link issue TEST-123 to epic EPIC-456. No epic link "
+                "field on the issue holds the epic key after the update, so "
+                "your Jira instance might use a different field for epic links."
+            ),
+            id="unverified-link-valueerror",
+        ),
+        pytest.param(
+            RuntimeError("Could not link issue TEST-123: Jira rejected the update"),
+            id="api-failure-passthrough",
+        ),
+    ],
+)
+async def test_link_to_epic_propagates_unverified_link_failure(
+    jira_client, mock_jira_fetcher, raised
+):
+    """PROPX-398 server-layer contract: an unverified link must not read as done.
+
+    Measured on CHSTC-1102: the tool answered "Issue CHSTC-1102 has been linked
+    to epic CHSTC-574." while raw REST showed parent null, Epic Link
+    customfield_10006 null, ``updated`` identical to ``created`` and a changelog
+    with zero entries. ``link_issue_to_epic`` now raises when no candidate field
+    reads back as holding the epic key, and this test pins the *tool* end of
+    that: the failure reaches the caller and the success sentence is never
+    emitted next to it.
+
+    This is the guard the mixin tests cannot express. A later "don't break
+    callers" patch that wraps ``jira.link_issue_to_epic`` in try/except and
+    returns the old message would keep every unit test in
+    tests/unit/jira/test_epics.py green while fully restoring the measured lie.
+    """
+    mock_jira_fetcher.link_issue_to_epic.side_effect = raised
+
+    with pytest.raises(ToolError) as excinfo:
+        await jira_client.call_tool(
+            "jira_link_to_epic",
+            {"issue_key": "TEST-123", "epic_key": "EPIC-456"},
+        )
+
+    message = str(excinfo.value)
+    assert "Could not link issue TEST-123" in message
+    assert "has been linked to epic" not in message
+    mock_jira_fetcher.link_issue_to_epic.assert_called_once_with("TEST-123", "EPIC-456")
+
+
+@pytest.mark.anyio
 async def test_create_issue_accepts_json_string(jira_client, mock_jira_fetcher):
     """Ensure additional_fields can be a JSON string."""
     response = await jira_client.call_tool(
